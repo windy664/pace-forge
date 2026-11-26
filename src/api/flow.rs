@@ -223,6 +223,22 @@ fn try_stadium_track(
         ));
         return None;
     }
+    // 长宽比**下限**（issue #37）：环形跑道是「直道 + 两端半圆」，
+    // 长轴必然明显长于短轴 —— 标准 400m 外框 177×92.5（1.91），
+    // 校内小场 160×75（2.13），100×60 的小场地也是 1.67。
+    // **1.5 以下说明外框「太圆」**：短轴几乎等于
+    // 标准跑道的宽，长轴却短一大截（实测 130.8×93.5 = 1.40：短轴像标准跑道，
+    // 长轴短 26%）—— 这种形状两头没有直道，不是跑道。
+    //
+    // 不拦的话它会掉进下面的「小场拟合」分支：按半径 26m 生成（真跑道 36.8），
+    // 于是 3 个打卡点落到圈外 16~20m，只能硬吸附 → 轨迹凹向点位 →
+    // 里程缩水 11.6%（实测 2000m 只跑出 1768m），地图上是一堆尖刺。
+    if aspect < 1.5 {
+        log(&format!(
+            "[track] 打卡点外框 {major:.0}×{minor:.0}m（长宽比 {aspect:.1}）太圆，不像环形跑道，改用路线规划"
+        ));
+        return None;
+    }
 
     // 先认标准跑道。
     //
@@ -236,7 +252,11 @@ fn try_stadium_track(
     // 外准差给足（长 ±28、宽 ±22），覆盖实测里打卡点略微内缩的情况。
     let looks_standard_400 = (major - 177.0).abs() < 28.0 && (minor - 92.5).abs() < 22.0;
     // 280m 左右的校内小场也常见（直道 ~55、半径 ~26），外框约 160×75。
-    let looks_small_oval = (major - 160.0).abs() < 30.0 && (minor - 75.0).abs() < 20.0;
+    // 小场拟合的**形状一致性**：真实小场外框 160×75 ⇒ 短轴只占长轴的 0.47。
+    // 只看两个独立容差会「各自擦边」地误命中（实测 130.8×93.5：|130.8-160|=29.2<30、
+    // |93.5-75|=18.5<20，两条都差一点就过 ⇒ 被当成小场）。
+    let looks_small_oval =
+        (major - 160.0).abs() < 30.0 && (minor - 75.0).abs() < 20.0 && minor <= major * 0.55;
 
     let (radius, straight) = if looks_standard_400 {
         // 第 1 道：36.5 内突沿 + 0.30 内突沿到分道线
@@ -4202,6 +4222,24 @@ mod issue37_tests {
         }
     }
 
+    /// 造一个 major×minor 的矩形四角点位（用来喂外框判据）。
+    fn rounded_rect_points(major: f64, minor: f64) -> Vec<Checkpoint> {
+        let (lat0, lng0) = (23.457, 113.499);
+        let klat = crate::track::geo::m_per_deg_lat(lat0);
+        let klng = crate::track::geo::m_per_deg_lng(lat0);
+        let (dx, dy) = (major / 2.0, minor / 2.0);
+        [(-dx, -dy), (dx, -dy), (dx, dy), (-dx, dy)]
+            .into_iter()
+            .map(|(x, y)| Checkpoint {
+                lat: lat0 + y / klat,
+                lng: lng0 + x / klng,
+                glat: lat0,
+                glon: lng0,
+                name: "P".into(),
+            })
+            .collect()
+    }
+
     /// issue #37：123×86 这类外框长宽比放行，但点位数组序与绕圈序不一致 → 闸拒。
     #[test]
     fn order_gate_rejects_out_of_order() {
@@ -4212,6 +4250,44 @@ mod issue37_tests {
         assert!(
             !stadium_point_order_ok(&pts, &cps, &mut log),
             "不同序必须回退"
+        );
+    }
+
+    /// issue #37 补：外框「太圆」（长宽比 < 1.7）⇒ 不按跑道拟合，回退路线规划。
+    ///
+    /// 实测某校点位外框 130.8×93.5（长宽比 1.40）：短轴几乎等于标准跑道的
+    /// 92.5，长轴却短 26% —— 两头没有直道，不是跑道。以前会被「小场拟合」
+    /// 擦边命中（两个容差各自差一点），按半径 26m 生成 ⇒ 3 个打卡点落到圈外
+    /// 16~20m ⇒ 硬吸附出凹痕 ⇒ 里程缩水 11.6%。
+    #[test]
+    fn too_round_frame_is_not_fitted_as_a_track() {
+        let cps = rounded_rect_points(130.8, 93.5);
+        let mut log = |_s: &str| {};
+        assert!(
+            try_stadium_track(&cps, 2000.0, 5.0, 7, &mut log).is_none(),
+            "太圆的外框不该按跑道拟合"
+        );
+    }
+
+    /// 标准 400m 外框（177×92.5）仍然照旧拟合 —— 新判据不许误伤真跑道。
+    #[test]
+    fn standard_400m_frame_is_still_fitted() {
+        let cps = rounded_rect_points(177.0, 92.5);
+        let mut log = |_s: &str| {};
+        assert!(
+            try_stadium_track(&cps, 2000.0, 5.0, 7, &mut log).is_some(),
+            "标准跑道外框不该被新判据拦掉"
+        );
+    }
+
+    /// 真实小场（160×75，长宽比 2.13）仍然照旧拟合。
+    #[test]
+    fn small_oval_frame_is_still_fitted() {
+        let cps = rounded_rect_points(160.0, 75.0);
+        let mut log = |_s: &str| {};
+        assert!(
+            try_stadium_track(&cps, 2000.0, 5.0, 7, &mut log).is_some(),
+            "小场外框不该被新判据拦掉"
         );
     }
 
