@@ -1355,6 +1355,18 @@ fn run_with_start(
             if o.submitted {
                 println!("\n✅ 提交成功，记录 id={:?}", o.record_id);
                 println!("   {} 秒内不要再跑", flow::SILENCE_SEC);
+                // 提交成功 ≠ 安全：服务端是**事后回扫**判定的（上游 issue #51 实测
+                // pace-forge 生成的记录提交时六项全绿，4~7 天后仍被判 isCheat=1、
+                // 申诉通道关闭；同账号真机记录一条都没被标）。这里把复查办法直接
+                // 印出来，免得过几天发现被判违规却不知道从哪查。
+                if let Some(rrid) = o.record_id {
+                    println!(
+                        "   ⚠ 事后复查：4 天后跑 `pace-forge records 1` 看记录 {rrid} 还在不在，"
+                    );
+                    println!(
+                        "     或 `pace-forge cheat` 看违规条数（被回扫了会 +1，申诉也会关掉）"
+                    );
+                }
             } else {
                 println!("\n已取消");
             }
