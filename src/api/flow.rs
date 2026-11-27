@@ -2608,36 +2608,29 @@ pub fn run_full(
             // `api::records::list_records` 与 `api::semester::derived_count`），
             // 原来这里只判 `v.as_array()` ⇒ 分支永远不进 ⇒ 「今日已跑」恒为 0
             // ⇒ 日上限从来没真正拦过（实测当天已跑 2262m，日志仍报 0m）。
-            let arr: Vec<Value> = match v.as_array() {
-                Some(a) => a.clone(),
-                None => v
-                    .get("records")
-                    .and_then(|x| x.as_array())
-                    .cloned()
-                    .unwrap_or_default(),
-            };
-            {
-                for r in arr {
-                    let st = r
-                        .get("startTime")
-                        .and_then(|x| x.as_i64())
-                        .or_else(|| {
-                            r.get("startTime")
-                                .and_then(|x| x.as_str())
-                                .and_then(|s| s.parse::<i64>().ok())
-                        })
-                        .unwrap_or(0);
-                    // startTime 可能是秒也可能是毫秒（服务端两种都见过）。
-                    // 按数量级判断：小于 1e11 当秒处理，乘 1000——之前直接按
-                    // 毫秒算，结果全落到 1970 年，日上限永远显示 0m。
-                    let st_ms = if st > 0 && st < 100_000_000_000 {
-                        st * 1000
-                    } else {
-                        st
-                    };
-                    if day_key_of(st_ms) == today {
-                        done += r.get("totalDis").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                    }
+            //
+            // 口径与上游统一到 `records::records_of`（上游 PR #69），
+            // `semester::derived_count` 也走同一个 helper。
+            for r in super::records::records_of(&v) {
+                let st = r
+                    .get("startTime")
+                    .and_then(|x| x.as_i64())
+                    .or_else(|| {
+                        r.get("startTime")
+                            .and_then(|x| x.as_str())
+                            .and_then(|s| s.parse::<i64>().ok())
+                    })
+                    .unwrap_or(0);
+                // startTime 可能是秒也可能是毫秒（服务端两种都见过）。
+                // 按数量级判断：小于 1e11 当秒处理，乘 1000——之前直接按
+                // 毫秒算，结果全落到 1970 年，日上限永远显示 0m。
+                let st_ms = if st > 0 && st < 100_000_000_000 {
+                    st * 1000
+                } else {
+                    st
+                };
+                if day_key_of(st_ms) == today {
+                    done += r.get("totalDis").and_then(|x| x.as_f64()).unwrap_or(0.0);
                 }
             }
             let after = done + p.distance_m;
