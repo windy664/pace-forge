@@ -1787,7 +1787,9 @@ fn sample_stage(
     };
     let len_before = len_of(&track_points);
     let snapshot = track_points.clone();
-    let nudged = crate::track::nudge_to_corners(&mut track_points, &xy, 12.0);
+    // `pinned` = 被吸附钉在打卡点上的点：拐角补位不许挪它们（挪了打卡点的
+    // 命中点就没了 ⇒ 服务端看到的「首次经过」会落到后面几圈 ⇒ 顺序判失败）。
+    let nudged = crate::track::nudge_to_corners(&mut track_points, &xy, 12.0, &pinned);
     if nudged > 0 {
         let len_after = len_of(&track_points);
         let drift = if len_before > 0.0 {

@@ -473,58 +473,126 @@ mod tests {
         let v_floor = 1.67f64;
         let v_ceil = 7.68f64;
         let radius = 10.0f64;
-        let mut broken = Vec::new();
+        let mut broken: Vec<(f64, u64, Vec<usize>)> = Vec::new();
 
-        for k in 0..24u64 {
-            let start_ms = 1_700_000_000_000i64 + (k as i64) * 997;
-            let seed = start_ms as u64;
-            let geom = lap_track_through(&cps, 3000.0, 5.0, seed);
-            let geo_first = first_pass(&geom, &cps, radius);
-            assert!(
-                geo_first.windows(2).all(|w| w[0] < w[1]),
-                "几何层首过序应递增，实际 {geo_first:?}"
-            );
-
-            let times = super::super::sample_times(total_sec, start_ms, 5.0);
-            let mut pts = super::super::sample_by_time(
-                &geom,
-                &times,
-                start_ms as u64,
-                &super::super::kinematics::KinParams::default(),
-                v_floor,
-                v_ceil,
-                &[],
-                &cps,
-            );
-            let stage_sample = first_pass(&xy_of(&pts), &cps, radius);
-            super::super::compress_startup(&mut pts, start_ms, total_sec, Some(v_ceil), &cps);
-            let stage_compress = first_pass(&xy_of(&pts), &cps, radius);
-            super::super::align_samples_to_checkpoints(&mut pts, &cps);
-            let stage_align = first_pass(&xy_of(&pts), &cps, radius);
-            let snap = super::super::snap_checkpoints(&mut pts, &cps);
-            let pinned: Vec<usize> = snap
-                .items
-                .iter()
-                .filter(|s| s.shifted)
-                .map(|s| s.index)
-                .collect();
-            let max_gap =
-                crate::api::submit::MAX_POINT_SPEED_MPS * super::super::SAMPLE_INTERVAL_SEC;
-            super::super::clamp_sample_gaps(&mut pts, &pinned, max_gap);
-            super::super::nudge_to_corners(&mut pts, &geom, 12.0);
-            super::super::clamp_sample_gaps(&mut pts, &pinned, max_gap);
-
-            let final_first = first_pass(&xy_of(&pts), &cps, radius);
-            if !final_first.windows(2).all(|w| w[0] < w[1]) {
-                broken.push((k, final_first.clone()));
-                println!(
-                    "seed {k}: 采样后 {stage_sample:?} / 压缩后 {stage_compress:?} / 对齐后 {stage_align:?} / 最终 {final_first:?}"
+        // 只扫 3.0km —— 生产用的距离。别的距离（2.5/2.9/3.2/3.5km）已知还会
+        // 乱，见下面那个 #[ignore] 的已知问题测试。
+        for dist_m in [3000.0_f64] {
+            for k in 0..24u64 {
+                let start_ms = 1_700_000_000_000i64 + (k as i64) * 997;
+                let seed = start_ms as u64;
+                let geom = lap_track_through(&cps, dist_m, 5.0, seed);
+                let geo_first = first_pass(&geom, &cps, radius);
+                assert!(
+                    geo_first.windows(2).all(|w| w[0] < w[1]),
+                    "几何层首过序应递增，实际 {geo_first:?}"
                 );
+
+                let times = super::super::sample_times(total_sec, start_ms, 5.0);
+                let mut pts = super::super::sample_by_time(
+                    &geom,
+                    &times,
+                    start_ms as u64,
+                    &super::super::kinematics::KinParams::default(),
+                    v_floor,
+                    v_ceil,
+                    &[],
+                    &cps,
+                );
+                let stage_sample = first_pass(&xy_of(&pts), &cps, radius);
+                super::super::compress_startup(&mut pts, start_ms, total_sec, Some(v_ceil), &cps);
+                let stage_compress = first_pass(&xy_of(&pts), &cps, radius);
+                super::super::align_samples_to_checkpoints(&mut pts, &cps);
+                let stage_align = first_pass(&xy_of(&pts), &cps, radius);
+                let snap = super::super::snap_checkpoints(&mut pts, &cps);
+                let pinned: Vec<usize> = snap
+                    .items
+                    .iter()
+                    .filter(|s| s.shifted)
+                    .map(|s| s.index)
+                    .collect();
+                let max_gap =
+                    crate::api::submit::MAX_POINT_SPEED_MPS * super::super::SAMPLE_INTERVAL_SEC;
+                super::super::clamp_sample_gaps(&mut pts, &pinned, max_gap);
+                super::super::nudge_to_corners(&mut pts, &geom, 12.0, &pinned);
+                super::super::clamp_sample_gaps(&mut pts, &pinned, max_gap);
+
+                let final_first = first_pass(&xy_of(&pts), &cps, radius);
+                if !final_first.windows(2).all(|w| w[0] < w[1]) {
+                    broken.push((dist_m, k, final_first.clone()));
+                    println!(
+                        "dist {dist_m} seed {k}: 采样后 {stage_sample:?} / 压缩后 {stage_compress:?} / 对齐后 {stage_align:?} / 最终 {final_first:?}"
+                    );
+                }
             }
         }
         assert!(
             broken.is_empty(),
             "上报层首过序在部分 seed 上乱序：{broken:?}"
+        );
+    }
+
+    /// **已知问题（未修）**：上报层的首过序只在 3.0km 上稳。
+    ///
+    /// 扫 5 个距离 × 24 个种子：3.0km 全过；2.5/2.9/3.2/3.5km 会出乱序
+    /// （圈数变了 ⇒ 起步窗口在路径上覆盖的弧长比例变了 ⇒ 打卡点落不落在
+    /// 窗口里跟着变）。实测 2.9km/seed 2：几何层首过序 [9,44,63,85,104] ✓，
+    /// 采样层却变成 [4,11,63,70,27] —— #4 被**提前**经过。
+    ///
+    /// 机制（已定位到一半）：路径在发夹处**自折**（两支挨得近），采样点/
+    /// 拐角补位一旦落进某个打卡点的 10m 邻域，就等于替它「提前经过」，
+    /// 服务端按 10m 半径判首次经过时次序就反了。真正的修法在几何层：
+    /// 把发夹撑开，让两支在空间上分开 >20m（路径不相邻 ⇒ 不会有提前经过）。
+    ///
+    /// 这个测试是 `#[ignore]` 的：它是**已知问题的记录**，不是门禁。
+    /// 等几何层修好（路径不自折）再把它转成断言。
+    #[test]
+    #[ignore = "已知问题：非 3.0km 的距离上上报层首过序仍会乱，等几何层修好"]
+    fn known_reported_order_breaks_at_other_distances() {
+        let cps = scrambled();
+        let total_sec = 1080i64;
+        let radius = 10.0f64;
+        let mut broken: Vec<(f64, u64)> = Vec::new();
+        for dist_m in [2500.0_f64, 2900.0, 3000.0, 3200.0, 3500.0] {
+            for k in 0..24u64 {
+                let start_ms = 1_700_000_000_000i64 + (k as i64) * 997;
+                let geom = lap_track_through(&cps, dist_m, 5.0, start_ms as u64);
+                let times = super::super::sample_times(total_sec, start_ms, 5.0);
+                let mut pts = super::super::sample_by_time(
+                    &geom,
+                    &times,
+                    start_ms as u64,
+                    &super::super::kinematics::KinParams::default(),
+                    1.67,
+                    7.68,
+                    &[],
+                    &cps,
+                );
+                super::super::compress_startup(&mut pts, start_ms, total_sec, Some(7.68), &cps);
+                super::super::align_samples_to_checkpoints(&mut pts, &cps);
+                let snap = super::super::snap_checkpoints(&mut pts, &cps);
+                let pinned: Vec<usize> = snap
+                    .items
+                    .iter()
+                    .filter(|s| s.shifted)
+                    .map(|s| s.index)
+                    .collect();
+                let max_gap =
+                    crate::api::submit::MAX_POINT_SPEED_MPS * super::super::SAMPLE_INTERVAL_SEC;
+                super::super::clamp_sample_gaps(&mut pts, &pinned, max_gap);
+                super::super::nudge_to_corners(&mut pts, &geom, 12.0, &pinned);
+                super::super::clamp_sample_gaps(&mut pts, &pinned, max_gap);
+                let fp = first_pass(&xy_of(&pts), &cps, radius);
+                if !fp.windows(2).all(|w| w[0] < w[1]) {
+                    broken.push((dist_m, k));
+                }
+            }
+        }
+        println!("乱序组合: {broken:?}");
+        assert!(
+            broken.is_empty(),
+            "上报层首过序在 {} 个组合上乱序：{broken:?}",
+            broken.len()
         );
     }
 

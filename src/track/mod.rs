@@ -944,6 +944,8 @@ pub fn sample_by_time(
     // 可以差 20m 以上（实测 24.8m）。靠 `snap_checkpoints` 事后瞬移补救会
     // 把轨迹扯出 40m 的相邻间距（`GEO_JUMP` 风险），所以这里直接让网格
     // 对齐：采样点落在点位弧长上，两侧间距只被拉伸 ≤ 半个步长。
+    // 被钉到打卡点上的采样下标：后面的拐角 override 不许再挪它们。
+    let mut pinned: Vec<usize> = Vec::new();
     if !checkpoints.is_empty() && n >= 3 {
         for &cp in checkpoints {
             // **首次**经过的那一段，不是全局最近的那一段：多圈轨迹上同一个
@@ -953,23 +955,27 @@ pub fn sample_by_time(
                 // 轨迹压根没经过它：不动，让 preflight 如实报 CP_MISS
                 continue;
             };
-            let mut idx = 0usize;
-            let mut best = f64::INFINITY;
-            for (i, &x) in s.iter().enumerate() {
-                let d = (x - target.0).abs();
-                if d < best {
-                    best = d;
-                    idx = i;
+            // 按「离目标弧长多远」排候选，逐个试：最近的那个可能**挪不动**
+            // （两侧邻居太近，`lo >= hi`），这时换下一个候选，而不是直接放弃
+            // ——放弃就等于这个打卡点没被命中，服务端的「首次经过」会落到
+            // 后面几圈，次序就乱了。
+            let mut cands: Vec<(f64, usize)> = s
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i > 0 && *i + 1 < n)
+                .map(|(i, x)| ((*x - target.0).abs(), i))
+                .collect();
+            cands.sort_by(|a, b| a.0.total_cmp(&b.0));
+            for (_, idx) in cands.iter().take(6) {
+                let lo = s[idx - 1] + MIN_SAMPLE_GAP_M;
+                let hi = s[idx + 1] - MIN_SAMPLE_GAP_M;
+                if lo < hi {
+                    s[*idx] = target.0.clamp(lo, hi);
+                    if !pinned.contains(idx) {
+                        pinned.push(*idx);
+                    }
+                    break;
                 }
-            }
-            // 不许挤掉首尾点，也不许把相邻间距压成 0
-            if idx == 0 || idx + 1 >= n {
-                continue;
-            }
-            let lo = s[idx - 1] + MIN_SAMPLE_GAP_M;
-            let hi = s[idx + 1] - MIN_SAMPLE_GAP_M;
-            if lo < hi {
-                s[idx] = target.0.clamp(lo, hi);
             }
         }
     }
@@ -1017,7 +1023,25 @@ pub fn sample_by_time(
         let Some((vc, _dev)) = picked else {
             continue;
         };
-        override_pos = Some(point_at_arc(path, &arc, vc));
+        // **不许挪走钉在打卡点上的采样点**：那会让打卡点的命中点凭空消失
+        // ——服务端的「首次经过」于是落到后面几圈，「按顺序通过所有点位」
+        // 判失败（实测 dist 2500 / seed 2：#4 的首过从 22 跳到 102）。
+        if pinned.contains(&(i + 1)) {
+            continue;
+        }
+        // **也不许把点挪进某个打卡点的命中半径内**（服务端按这个半径判
+        // 「经过」）：路径在发夹处自折，拐角顶点有时离某个打卡点只有几米；
+        // 把采样点挪到那个拐角，就等于替它「提前经过」了那个打卡点 ⇒
+        // 首次经过次序乱（实测 dist 2900 / seed 2：#4 的首过从 104 提前到
+        // 27，而 #2/#3 还在 63/70 ⇒ 顺序反了）。
+        let vc_pt = point_at_arc(path, &arc, vc);
+        if checkpoints
+            .iter()
+            .any(|cp| geo::distance(vc_pt, *cp) < crate::api::submit::FIXED_POINT_HIT_M)
+        {
+            continue;
+        }
+        override_pos = Some(vc_pt);
     }
     out
 }
@@ -1121,36 +1145,34 @@ pub fn align_samples_to_checkpoints(pts: &mut [TrackPoint], cps: &[(f64, f64)]) 
             // 轨迹压根没经过它：不动，让 preflight 如实报 CP_MISS
             continue;
         };
-        let mut idx = usize::MAX;
-        let mut best = f64::INFINITY;
-        for (i, &a) in arc.iter().enumerate() {
-            if taken.contains(&i) || i == 0 || i + 1 >= n {
-                continue;
-            }
-            let d = (a - arc_cp).abs();
-            if d < best {
-                best = d;
-                idx = i;
-            }
-        }
-        if idx == usize::MAX {
-            continue;
-        }
+        // 按「离目标弧长多远」排候选，逐个试：最近的那个可能挪不动（两侧邻居
+        // 太近 ⇒ `lo >= hi`），换下一个候选而不是放弃——放弃就等于这个打卡点
+        // 没被命中，首次经过会落到后面几圈。
+        let mut cands: Vec<(f64, usize)> = arc
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !taken.contains(i) && *i > 0 && *i + 1 < n)
+            .map(|(i, a)| ((*a - arc_cp).abs(), i))
+            .collect();
+        cands.sort_by(|a, b| a.0.total_cmp(&b.0));
         // 位移边界由下面那对 clamp 兜住（只在 idx-1 和 idx+1 之间挪），
         // 所以不再额外用「半个步长」提前放弃——那会让 12m 的偏差漏给吸附去
         // 硬拽，反而扯出更大的相邻间距。
-        let lo = arc[idx - 1] + MIN_SAMPLE_GAP_M;
-        let hi = arc[idx + 1] - MIN_SAMPLE_GAP_M;
-        // 起步段被压平后相邻点可能只差几厘米，这时候 lo > hi，`clamp` 会 panic；
-        // 那种位置的网格本来就在几米内穿过所有点位，不需要对齐。
-        if lo >= hi {
-            continue;
+        for (_, idx) in cands.iter().take(6) {
+            let lo = arc[idx - 1] + MIN_SAMPLE_GAP_M;
+            let hi = arc[idx + 1] - MIN_SAMPLE_GAP_M;
+            // 起步段被压平后相邻点可能只差几厘米，这时候 lo > hi，`clamp` 会 panic；
+            // 那种位置的网格本来就在几米内穿过所有点位，不需要对齐。
+            if lo >= hi {
+                continue;
+            }
+            let target = point_at_arc(&xy, &arc, arc_cp.clamp(lo, hi));
+            pts[*idx].lat = target.0;
+            pts[*idx].lon = target.1;
+            taken.push(*idx);
+            done += 1;
+            break;
         }
-        let target = point_at_arc(&xy, &arc, arc_cp.clamp(lo, hi));
-        pts[idx].lat = target.0;
-        pts[idx].lon = target.1;
-        taken.push(idx);
-        done += 1;
     }
     done
 }
@@ -1417,7 +1439,12 @@ fn point_to_segment_m(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
 /// 制造不必要的抖动。
 ///
 /// 返回移动的点数。
-pub fn nudge_to_corners(pts: &mut [TrackPoint], dense: &[(f64, f64)], dev_m: f64) -> usize {
+pub fn nudge_to_corners(
+    pts: &mut [TrackPoint],
+    dense: &[(f64, f64)],
+    dev_m: f64,
+    pinned: &[usize],
+) -> usize {
     if pts.len() < 3 || dense.len() < 3 || dev_m <= 0.0 {
         return 0;
     }
@@ -1462,6 +1489,10 @@ pub fn nudge_to_corners(pts: &mut [TrackPoint], dense: &[(f64, f64)], dev_m: f64
         // 把终点挪到拐角上。起点不动——起点是上一点，动它会让前一段也跟着变。
         // 末点不挪：它是收尾哨兵，位置有语义。
         if i + 1 == pts.len() - 1 {
+            continue;
+        }
+        // **钉在打卡点上的点不许挪**：挪了打卡点的命中点就没了。
+        if pinned.contains(&(i + 1)) {
             continue;
         }
         // **挪动距离必须设上限**。拐角半径通常十几米，挪得比这多说明最近
@@ -1616,7 +1647,7 @@ mod tests {
             tp(end.0 + 30.0 * mlat, end.1, 10000), // 第三点：让第二点不是末点
         ];
         let before = pts[1];
-        let moved = nudge_to_corners(&mut pts, &dense, 5.0);
+        let moved = nudge_to_corners(&mut pts, &dense, 5.0, &[]);
         assert_eq!(moved, 1, "应当移动 1 个点");
         // 时间戳一个都不许动
         assert_eq!(pts[1].time_ms, before.time_ms);
@@ -1644,7 +1675,7 @@ mod tests {
             tp(straight[30].0, straight[30].1, 5000),
         ];
         let before = pts.clone();
-        let moved = nudge_to_corners(&mut pts, &straight, 12.0);
+        let moved = nudge_to_corners(&mut pts, &straight, 12.0, &[]);
         assert_eq!(moved, 0, "直线段不该动");
         assert_eq!(pts[1].lat, before[1].lat);
     }
@@ -1654,7 +1685,7 @@ mod tests {
         let dense = bent_shape();
         let (start, end) = (dense[0], dense[30]);
         let mut pts = vec![tp(start.0, start.1, 0), tp(end.0, end.1, 5000)];
-        let _ = nudge_to_corners(&mut pts, &dense, 12.0);
+        let _ = nudge_to_corners(&mut pts, &dense, 12.0, &[]);
         // 末点（收尾哨兵）位置保持不变——即使它跨过了整个拐角
         assert_eq!((pts[1].lat, pts[1].lon), (end.0, end.1));
     }
@@ -1663,14 +1694,14 @@ mod tests {
     fn degenerate_inputs_are_noops() {
         let dense = bent_shape();
         let mut one = vec![tp(dense[0].0, dense[0].1, 0)];
-        assert_eq!(nudge_to_corners(&mut one, &dense, 12.0), 0);
+        assert_eq!(nudge_to_corners(&mut one, &dense, 12.0, &[]), 0);
         let mut two = vec![
             tp(dense[0].0, dense[0].1, 0),
             tp(dense[30].0, dense[30].1, 5000),
         ];
-        assert_eq!(nudge_to_corners(&mut two, &[], 12.0), 0);
-        assert_eq!(nudge_to_corners(&mut two, &dense, 0.0), 0);
-        assert_eq!(nudge_to_corners(&mut two, &dense, -1.0), 0);
+        assert_eq!(nudge_to_corners(&mut two, &[], 12.0, &[]), 0);
+        assert_eq!(nudge_to_corners(&mut two, &dense, 0.0, &[]), 0);
+        assert_eq!(nudge_to_corners(&mut two, &dense, -1.0, &[]), 0);
     }
 
     #[test]
@@ -1679,7 +1710,7 @@ mod tests {
         let (start, end) = (dense[0], dense[30]);
         let mut pts = vec![tp(start.0, start.1, 0), tp(end.0, end.1, 5000)];
         // 阈值大于实际偏离（8m）就不动
-        assert_eq!(nudge_to_corners(&mut pts, &dense, 9.0), 0);
+        assert_eq!(nudge_to_corners(&mut pts, &dense, 9.0, &[]), 0);
     }
 
     // ---- merged from former `mod queue_num_tests` ----
