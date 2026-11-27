@@ -18,6 +18,37 @@ fn normal_sample(rng: &mut impl rand::Rng) -> f64 {
     (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
 }
 
+/// 解析步频回归系数：读不到 / 不合法就用默认值。
+fn parse_cad_coeffs(intercept: Option<&str>, slope: Option<&str>) -> (f64, f64) {
+    let pick = |raw: Option<&str>, default: f64| {
+        raw.and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(default)
+    };
+    (pick(intercept, 34.4), pick(slope, 44.5))
+}
+
+/// 步频回归的系数（`cadence = intercept + slope * v`）。
+///
+/// **默认就是原来那对常数**（34.4 / 44.5，来自 4 条真实记录的回归）⇒
+/// 不设环境变量时行为逐字节不变。
+///
+/// 为什么要能配：回归是**从某个人的 4 条记录**拟合的，而服务端的判定看的是
+/// **账号画像**——同一个公式在不同账号身上的「像不像本人」不一样。
+/// 某账号自己的真实步频比公式高 5~13% 时，公式生成的步频偏低、步幅就偏长
+/// （步幅 = 速度×60/步频），报文的步态与该账号的历史记录对不上。
+/// `PACE_CAD_INTERCEPT` / `PACE_CAD_SLOPE` 让部署方按**自己账号的历史**标定。
+///
+/// 用 `OnceLock` 缓存：热路径（每个轨迹点）读环境变量太贵。
+fn cad_coeffs() -> (f64, f64) {
+    static COEFFS: std::sync::OnceLock<(f64, f64)> = std::sync::OnceLock::new();
+    *COEFFS.get_or_init(|| {
+        let intercept = std::env::var("PACE_CAD_INTERCEPT").ok();
+        let slope = std::env::var("PACE_CAD_SLOPE").ok();
+        parse_cad_coeffs(intercept.as_deref(), slope.as_deref())
+    })
+}
+
 /// 步态：步频与步幅。
 #[derive(Clone, Copy, Debug)]
 pub struct Gait {
@@ -53,7 +84,8 @@ pub const GAIT_REGRESSION_FLOOR_MPS: f64 = 2.0;
 
 pub fn gait(v: f64, fatigue: f64) -> Gait {
     if v >= GAIT_REGRESSION_FLOOR_MPS {
-        let target_cad = (34.4 + 44.5 * v) * (1.0 - 0.05 * fatigue);
+        let (intercept, slope) = cad_coeffs();
+        let target_cad = (intercept + slope * v) * (1.0 - 0.05 * fatigue);
         let mut cadence = target_cad.clamp(100.0, 210.0);
         let mut stride = if cadence > 0.0 {
             v * 60.0 / cadence
@@ -74,12 +106,26 @@ pub fn gait(v: f64, fatigue: f64) -> Gait {
         // 慢速走跑段（见上面的锚点说明）。上端锚在回归于 2.0 的取值上
         // （123.4 步/分 → 步幅 0.973m），保证两侧连续；下端锚 1.40 →
         // 0.47m（#7 真机实测）。1.40 以下步频近似恒定、步幅随速度缩。
+        //
+        // 端点步幅跟着回归系数走：配了 `PACE_CAD_*` 就按新系数重算端点，
+        // 否则快慢两段在 2.0 m/s 处会断开。默认系数下端点仍取原来的
+        // 0.9733（**逐字节不变**）。
+        let (intercept, slope) = cad_coeffs();
+        let anchor_stride = if (intercept - 34.4).abs() < f64::EPSILON
+            && (slope - 44.5).abs() < f64::EPSILON
+        {
+            0.9733
+        } else {
+            (GAIT_REGRESSION_FLOOR_MPS * 60.0
+                / (intercept + slope * GAIT_REGRESSION_FLOOR_MPS))
+                .clamp(0.5, 1.2)
+        };
         let stride0 = if v >= 1.40 {
-            0.47 + (v - 1.40) * (0.9733 - 0.47) / (2.0 - 1.40)
+            0.47 + (v - 1.40) * (anchor_stride - 0.47) / (2.0 - 1.40)
         } else {
             0.47 * v / 1.40
         }
-        .clamp(0.0, 0.9733);
+        .clamp(0.0, anchor_stride);
         // 步频下限只防退化（v→0 时步幅缩到 0、等式仍成立），不再夹 100：
         // 慢跑真机步频 179，夹 100 会把它打平成一条 100 出头的直线。
         let mut cadence = (v * 60.0 / stride0.max(1e-9)) * (1.0 - 0.05 * fatigue);
@@ -194,6 +240,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **默认系数必须逐字节不变**：`PACE_CAD_*` 没设时就是 34.4 / 44.5。
+    #[test]
+    fn default_coefficients_are_unchanged() {
+        let (intercept, slope) = parse_cad_coeffs(None, None);
+        assert_eq!(intercept, 34.4);
+        assert_eq!(slope, 44.5);
+        // 不合法 / 空值也回落到默认（配错了不能悄悄变成别的行为）。
+        assert_eq!(parse_cad_coeffs(Some(""), Some("  ")), (34.4, 44.5));
+        assert_eq!(parse_cad_coeffs(Some("abc"), Some("nope")), (34.4, 44.5));
+        assert_eq!(parse_cad_coeffs(Some("nan"), Some("inf")), (34.4, 44.5));
+    }
+
+    /// 配了系数就用它：步频变高 ⇒ 步幅变短（步幅 = 速度×60/步频）。
+    #[test]
+    fn coefficients_can_be_overridden() {
+        let (intercept, slope) = parse_cad_coeffs(Some("45.3"), Some("44.5"));
+        assert_eq!(intercept, 45.3);
+        assert_eq!(slope, 44.5);
+        // 默认公式在 2.78 m/s 给 158.1 步/分（步幅 1.055m）；
+        // 标定后 171.1 步/分 ⇒ 步幅 0.975m。
+        let default_cad = 34.4 + 44.5 * 2.78;
+        let calibrated_cad = intercept + slope * 2.78;
+        assert!(calibrated_cad > default_cad);
+        assert!(2.78 * 60.0 / calibrated_cad < 2.78 * 60.0 / default_cad);
     }
 
     #[test]

@@ -564,12 +564,19 @@ pub fn inspect_at(c: &Check, now_ms: Option<i64>) -> Report {
     }
 
     // 步幅
+    //
+    // 上界从 1.8 收到 1.03。原来的 1.8 宽到没有意义：真人步幅根本到不了
+    // 1.8 m，实测被服务端判「运动数据有问题」的记录步幅是 1.06~1.09，
+    // 而同账号被判干净的记录是 0.91~1.01 —— 中间是空的。
+    //
+    // **只提示不拦**：这个区间是「某账号 11 条记录」的统计，不是协议规则，
+    // 拦了等于拿统计当判据。真正的拦截交给提交方（脚本/自动化）决定。
     let stride = if implied > 0.0 {
         avg_v * 60.0 / implied
     } else {
         0.0
     };
-    if !(0.4..=1.8).contains(&stride) {
+    if !(0.4..=1.03).contains(&stride) {
         issues.push(Issue::warn(
             "STRIDE_OUT",
             format!("推算步幅 {stride:.2}m 超出常见范围"),
