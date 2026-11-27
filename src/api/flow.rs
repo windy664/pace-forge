@@ -2602,7 +2602,19 @@ pub fn run_full(
         Ok(v) => {
             let today = local_day_key();
             let mut done = 0.0f64;
-            if let Some(arr) = v.as_array() {
+            // `list_records` 回的是**对象** `{"records": [...]}`（见
+            // `api::records::list_records` 与 `api::semester::derived_count`），
+            // 原来这里只判 `v.as_array()` ⇒ 分支永远不进 ⇒ 「今日已跑」恒为 0
+            // ⇒ 日上限从来没真正拦过（实测当天已跑 2262m，日志仍报 0m）。
+            let arr: Vec<Value> = match v.as_array() {
+                Some(a) => a.clone(),
+                None => v
+                    .get("records")
+                    .and_then(|x| x.as_array())
+                    .cloned()
+                    .unwrap_or_default(),
+            };
+            {
                 for r in arr {
                     let st = r
                         .get("startTime")

@@ -70,6 +70,14 @@ pub enum HwHeaders {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Run {
     /// CLI 刷跑的 runMode：1=计分跑，2=户外跑。
+    ///
+    /// 默认 **1**（计分跑）：`run` 就是刷一条**计分跑**记录。
+    ///
+    /// 实测（2026-11-27）：默认值是 2 时，提交出去的那条**里程算进了学期
+    /// 有效里程（15.77→18.03km），但「有效次数」还是 0** —— 户外跑口径
+    /// 不计次数。而且 `should_try_stadium` 要求 run_mode==1，runMode=2 根本
+    /// 不会试操场轨迹 ⇒ 刷出来的是 route 兜底那条（首次经过次序靠种子凑）。
+    /// 户外跑要走 `run-free`（显式传 runMode=2 + sportType=4）。
     pub run_mode: i64,
     /// 几何采样间距（米）。
     pub step_m: f64,
@@ -118,7 +126,7 @@ pub struct Run {
 impl Default for Run {
     fn default() -> Self {
         Self {
-            run_mode: 2,
+            run_mode: 1,
             step_m: 5.0,
             bulge_max: 60.0,
             pt_scheme: PtScheme::Auto,
