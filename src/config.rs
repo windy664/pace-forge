@@ -102,6 +102,20 @@ const ENTRIES: &[Entry] = &[
         kind: Kind::Float,
     },
     Entry {
+        name: "PACE_CAD_INTERCEPT",
+        default: "34.4",
+        effect: "步频回归截距：cadence = 截距 + 斜率×v。按**自己账号**的历史步频标定（默认那对常数是从别人的 4 条记录拟合的）",
+        default_value: Some("34.4"),
+        kind: Kind::Float,
+    },
+    Entry {
+        name: "PACE_CAD_SLOPE",
+        default: "44.5",
+        effect: "步频回归斜率：cadence = 截距 + 斜率×v",
+        default_value: Some("44.5"),
+        kind: Kind::Float,
+    },
+    Entry {
         name: "PACE_DEVICE_HW_HEADERS",
         default: "empty（发空串）",
         effect: "derived = 五个硬件头（androidId/blMac/wifiMac/IMEI/CustomDeviceId）发派生假值；默认空串，与 7.4.21 硬编码一致。DeviceId 不受影响",
