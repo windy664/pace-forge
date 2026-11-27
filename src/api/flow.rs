@@ -803,8 +803,22 @@ fn stage_policy(client: &Client, p: &RunParams, log: &mut Log) -> Result<PolicyI
     let pol = match policy::fetch_policy_for(client, p.run_mode) {
         Ok(v) => {
             log(&format!(
-                "√ [policy] ts={} policy={} minDistance={} validTime={}",
-                v.timestamp, v.policy, v.min_distance, v.valid_time
+                "√ [policy] ts={} policy={} minDistance={} validTime={} freezeRunTime={}",
+                v.timestamp,
+                v.policy,
+                v.min_distance,
+                v.valid_time,
+                // 冻结期是服务端唯一的硬性阻断（App 里开始按钮会变倒计时），
+                // 之前只打在 run_full 的闸里，dry 阶段看不到 ⇒ 排查「能不能跑」时瞎着。
+                if v.freeze_run_time > 0 {
+                    format!(
+                        "{}（剩余 {} 秒）",
+                        v.freeze_run_time,
+                        (v.freeze_run_time - crate::crypto::envelope::now_ms()) / 1000
+                    )
+                } else {
+                    "无".to_owned()
+                }
             ));
             v
         }
