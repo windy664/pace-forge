@@ -8,6 +8,7 @@
 //! 3. `sportType=1` 必须命中所有打卡点（±0.1m）
 //! 4. 每 10 秒桶必须有自然抖动，不能等距
 
+use crate::error::{Error, ErrorKind};
 use rand::Rng;
 
 use super::geo::{distance, nearest_index, nudge_to, sample_along, scale_to_length};
@@ -17,29 +18,41 @@ use super::geo::{distance, nearest_index, nudge_to, sample_along, scale_to_lengt
 pub struct Checkpoint {
     /// BD-09（提交报文用）。
     pub lat: f64,
+    /// BD-09 经度。
     pub lng: f64,
     /// GCJ-02（高德地图展示用）。缺省时等于 BD-09，只在测试里出现。
     pub glat: f64,
+    /// GCJ-02 经度。
     pub glon: f64,
+    /// 点名。
     pub name: String,
 }
 
 /// 轨迹点。
 #[derive(Debug, Clone, Copy)]
 pub struct TrackPoint {
+    /// 纬度（BD-09）。
     pub lat: f64,
+    /// 经度（BD-09）。
     pub lon: f64,
+    /// 时间戳（毫秒）。
     pub time_ms: i64,
 }
 
 /// 规划请求。
 #[derive(Debug, Clone)]
 pub struct PlanRequest {
+    /// 校区中心纬度。
     pub center_lat: f64,
+    /// 校区中心经度。
     pub center_lng: f64,
+    /// 必须经过的打卡点，按顺序。
     pub checkpoints: Vec<Checkpoint>,
+    /// 目标里程（米）。
     pub total_distance_m: f64,
+    /// 目标时长（秒）。
     pub total_sec: i64,
+    /// 起跑时间戳（毫秒）。
     pub start_ms: i64,
     /// `sport_type=1` 计分跑（必须命中打卡点），`6` 自由跑。
     pub sport_type: i32,
@@ -71,8 +84,11 @@ impl Default for PlanRequest {
 /// 规划结果。
 #[derive(Debug, Clone)]
 pub struct PlanResult {
+    /// 轨迹点。
     pub points: Vec<TrackPoint>,
+    /// 回填后的打卡点。
     pub checkpoints: Vec<Checkpoint>,
+    /// 轨迹实际长度（米）。
     pub actual_length_m: f64,
 }
 
@@ -124,12 +140,17 @@ fn catmull_point(
     (f(p0.0, p1.0, p2.0, p3.0), f(p0.1, p1.1, p2.1, p3.1))
 }
 
-pub fn plan(req: &PlanRequest, rng: &mut impl Rng) -> Result<PlanResult, String> {
+#[expect(
+    clippy::unwrap_used,
+    reason = "non-empty is guaranteed by the construction above"
+)]
+/// 按请求规划一条轨迹；`rng` 供抖动使用，传入即可复现。
+pub fn plan(req: &PlanRequest, rng: &mut impl Rng) -> Result<PlanResult, Error> {
     if req.total_distance_m <= 0.0 {
-        return Err("目标里程必须为正".into());
+        return Err(ErrorKind::fence("目标里程必须为正".into()));
     }
     if req.total_sec <= 0 {
-        return Err("目标时长必须为正".into());
+        return Err(ErrorKind::fence("目标时长必须为正".into()));
     }
 
     let (mut cps, kind) = resolve_checkpoints(req, rng);
@@ -148,7 +169,7 @@ pub fn plan(req: &PlanRequest, rng: &mut impl Rng) -> Result<PlanResult, String>
     }
     let ring_len = super::geo::path_length(&ring);
     if ring_len <= 0.0 {
-        return Err("闭环长度为 0，无法规划".into());
+        return Err(ErrorKind::fence("闭环长度为 0，无法规划".into()));
     }
 
     // 2. 跑圈凑里程。
@@ -160,11 +181,11 @@ pub fn plan(req: &PlanRequest, rng: &mut impl Rng) -> Result<PlanResult, String>
     // （合成五边形 2000m → 2017m，+0.85%），这点差额交给后面的里程对齐
     // 缩放即可。只有明显超出（超过容差上限）才是真的装不下。
     if ring_len > slack {
-        return Err(format!(
+        return Err(ErrorKind::fence(format!(
             "目标里程 {:.0}m 装不下这 {n} 个打卡点（最短闭环 {ring_len:.0}m）",
             req.total_distance_m,
             n = cps.len()
-        ));
+        )));
     }
     let laps = (req.total_distance_m / ring_len).floor().max(1.0) as usize;
     let mut route: Vec<(f64, f64)> = Vec::with_capacity(ring.len() * laps + 8);
@@ -264,10 +285,10 @@ pub fn plan(req: &PlanRequest, rng: &mut impl Rng) -> Result<PlanResult, String>
                 anchor_idx.push(idx);
             } else {
                 // 采样点离打卡点太远，说明规划路径没真正经过它 —— 宁可报错也不伪造
-                return Err(format!(
+                return Err(ErrorKind::fence(format!(
                     "打卡点 {} 距最近采样点 {gap:.1}m，规划路径未经过该点",
                     cp.name
-                ));
+                )));
             }
         }
         // 吸附位移很小（≤ 采样间隔），长度影响在厘米级，不需要再缩放
@@ -379,7 +400,7 @@ fn closed_ring(
     start: (f64, f64),
     cps: &[(f64, f64)],
     in_order: bool,
-) -> Result<Vec<(f64, f64)>, String> {
+) -> Result<Vec<(f64, f64)>, Error> {
     let mut ring = loop_waypoints(start, cps, in_order);
     // loop_waypoints 返回的是首尾重复的闭合折线。转样条前必须去掉那个重复点：
     // 否则环上会出现一段长度为零的边，方向算不出来，轨迹在闭合处原地掉头。
@@ -395,6 +416,10 @@ fn closed_ring(
 /// 「按顺序通过所有点位」看的就是首次经过次序等于数组次序；最近邻串出来的
 /// 环次序由几何决定，和数组多半不同序（issue #37 的补充：无围栏学校关掉
 /// 操场后首过次序是 1→2→0→3→4）。合成点位没有这个约束，仍走最近邻。
+#[expect(
+    clippy::unwrap_used,
+    reason = "non-empty is guaranteed by the construction above"
+)]
 fn loop_waypoints(start: (f64, f64), cps: &[(f64, f64)], in_order: bool) -> Vec<(f64, f64)> {
     if cps.is_empty() {
         // 无点位：方形小环，边长按 120m 起步
@@ -727,12 +752,8 @@ mod tests {
             res.points.len()
         );
     }
-}
 
-#[cfg(test)]
-mod corner_smooth_tests {
-    use super::*;
-    use rand::SeedableRng;
+    // ---- merged from former `mod corner_smooth_tests` ----
 
     /// 矩形四角上的打卡点：贪心连点必然产生 90° 尖角。
     fn rect_cps() -> Vec<Checkpoint> {

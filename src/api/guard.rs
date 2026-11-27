@@ -16,6 +16,7 @@
 //! 台账按 uid 分文件，不同账号互不影响；同机多进程由 O_APPEND 的原子性兜底
 //! （每行一个独立事件，写一行是一次 `write`，不会互相截断）。
 
+use crate::error::{Error, ErrorKind};
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -26,14 +27,25 @@ use std::path::{Path, PathBuf};
 pub enum Event {
     /// 请求已发出，结果未知。
     Pending {
+        /// 这次提交的本地唯一 id。
         uuid: String,
+        /// 提交窗口起点（毫秒）。
         start_ms: i64,
+        /// 提交窗口终点（毫秒）。
         stop_ms: i64,
     },
     /// 服务端接受了，`rrid` 是记录 id。
-    Accepted { uuid: String, rrid: i64 },
+    Accepted {
+        /// 对应的本地提交 id。
+        uuid: String,
+        /// 服务端返回的记录 id。
+        rrid: i64,
+    },
     /// 服务端明确拒绝（有错误码、且能确定没有入账）。
-    Rejected { uuid: String },
+    Rejected {
+        /// 被拒的那次提交的本地 id。
+        uuid: String,
+    },
 }
 
 /// 一次提交尝试（由事件流回放出来）。
@@ -76,12 +88,13 @@ impl Guard {
     }
 
     /// 读台账并回放成尝试列表。文件不存在 = 空台账，不是错误。
-    pub fn open(data_dir: &Path, uid: &str) -> Result<Self, String> {
+    pub fn open(data_dir: &Path, uid: &str) -> Result<Self, Error> {
         let path = Self::path_for(data_dir, uid);
         let mut attempts: Vec<Attempt> = Vec::new();
         if path.exists() {
-            let text = std::fs::read_to_string(&path)
-                .map_err(|e| format!("读提交台账 {} 失败: {e}", path.display()))?;
+            let text = std::fs::read_to_string(&path).map_err(|e| {
+                ErrorKind::client(format!("读提交台账 {} 失败: {e}", path.display()))
+            })?;
             for (lineno, line) in text.lines().enumerate() {
                 let line = line.trim();
                 if line.is_empty() {
@@ -142,20 +155,23 @@ impl Guard {
 
     /// 追加一条事件。失败就是失败——台账写不下去时必须中止提交，
     /// 否则「有没有发出去」这件事就失去记录了。
-    fn append(&mut self, ev: Event) -> Result<(), String> {
+    fn append(&mut self, ev: Event) -> Result<(), Error> {
         if let Some(parent) = self.path.parent() {
             super::session::ensure_dir(parent)?;
         }
-        let mut line = serde_json::to_string(&ev).map_err(|e| format!("台账序列化失败: {e}"))?;
+        let mut line = serde_json::to_string(&ev)
+            .map_err(|e| ErrorKind::client(format!("台账序列化失败: {e}")))?;
         line.push('\n');
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
-            .map_err(|e| format!("打开提交台账 {} 失败: {e}", self.path.display()))?;
+            .map_err(|e| {
+                ErrorKind::client(format!("打开提交台账 {} 失败: {e}", self.path.display()))
+            })?;
         // 整行一次写出：O_APPEND 下单次 write 是原子的，多进程不会交错。
         f.write_all(line.as_bytes())
-            .map_err(|e| format!("写提交台账失败: {e}"))?;
+            .map_err(|e| ErrorKind::client(format!("写提交台账失败: {e}")))?;
         f.sync_all().ok();
         Self::apply(&mut self.attempts, ev);
         Ok(())
@@ -191,30 +207,30 @@ impl Guard {
     }
 
     /// 提交前检查：本轮能不能发。
-    pub fn check(&self, start_ms: i64, stop_ms: i64) -> Result<(), String> {
+    pub fn check(&self, start_ms: i64, stop_ms: i64) -> Result<(), Error> {
         if start_ms <= 0 || stop_ms <= start_ms {
-            return Err("提交时间范围无效".into());
+            return Err(ErrorKind::client("提交时间范围无效".into()));
         }
         // 只有**时间重叠**的未知结果才拦。不同时间段的新提交跟它无关，
         // 一刀切拦死会让一次超时把账号永久卡住。
         if let Some((ps, pe)) = self.pending_overlapping(start_ms, stop_ms) {
-            return Err(format!(
+            return Err(ErrorKind::client(format!(
                 "这段时间（{} ~ {}）上次提交结果未知，已阻止重复提交。\
                  未查到不代表未入账——请先到运动记录页刷新核对，确认没入账再重来。",
                 fmt_ms(ps),
                 fmt_ms(pe)
-            ));
+            )));
         }
         for a in &self.attempts {
             if let Some(Some(rrid)) = a.outcome {
                 // 半开区间重叠：起点在对方内部，或终点在对方内部，或完整包住。
                 if start_ms < a.stop_ms && stop_ms > a.start_ms {
-                    return Err(format!(
+                    return Err(ErrorKind::client(format!(
                         "该时间段（{} ~ {}）已有本工具提交的记录 #{rrid}，已阻止重复提交。\
                          请到运动记录查看详情。",
                         fmt_ms(a.start_ms),
                         fmt_ms(a.stop_ms)
-                    ));
+                    )));
                 }
             }
         }
@@ -222,7 +238,7 @@ impl Guard {
     }
 
     /// 请求发出**之前**调用：写 pending 并做检查。
-    pub fn begin(&mut self, uuid: &str, start_ms: i64, stop_ms: i64) -> Result<(), String> {
+    pub fn begin(&mut self, uuid: &str, start_ms: i64, stop_ms: i64) -> Result<(), Error> {
         self.check(start_ms, stop_ms)?;
         self.append(Event::Pending {
             uuid: uuid.to_string(),
@@ -232,7 +248,7 @@ impl Guard {
     }
 
     /// 拿到 rrid 之后调用。
-    pub fn accepted(&mut self, uuid: &str, rrid: i64) -> Result<(), String> {
+    pub fn accepted(&mut self, uuid: &str, rrid: i64) -> Result<(), Error> {
         self.append(Event::Accepted {
             uuid: uuid.to_string(),
             rrid,
@@ -242,7 +258,7 @@ impl Guard {
     /// **明确**被拒（有错误码、能确定没入账）时调用。
     ///
     /// 只在这种情况下用：超时、连接断开、响应看不懂，都算「未知」，不写。
-    pub fn rejected(&mut self, uuid: &str) -> Result<(), String> {
+    pub fn rejected(&mut self, uuid: &str) -> Result<(), Error> {
         self.append(Event::Rejected {
             uuid: uuid.to_string(),
         })
@@ -334,7 +350,7 @@ mod tests {
         g.begin("uuid-a", T0, T0 + H).unwrap();
         // 同一段时间：再发一次会产生两条时间重叠的记录，必须拦。
         let err = g.check(T0 + H / 2, T0 + H * 2).unwrap_err();
-        assert!(err.contains("结果未知"), "实际: {err}");
+        assert!(err.to_string().contains("结果未知"), "实际: {err}");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -367,7 +383,7 @@ mod tests {
         g.accepted("uuid-b", 12345).unwrap();
         // 重叠：起点落在里面
         let e = g.check(T0 + H / 2, T0 + 2 * H).unwrap_err();
-        assert!(e.contains("#12345"), "实际: {e}");
+        assert!(e.to_string().contains("#12345"), "实际: {e}");
         // 重叠：终点落在里面
         assert!(g.check(T0 - H, T0 + H / 2).is_err());
         // 重叠：完整包住

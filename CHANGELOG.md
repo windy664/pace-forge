@@ -15,8 +15,89 @@
 > 核心：按 7.4.20 真机（脱壳 + 真机报文）对齐提交体与设备头。**实测一条 2km/12min
 > 提交成功、App 详情页 5 个绿点、无 201。** 如果升级后提交异常，回滚 v0.1.10。
 
+### 文档
+
+- 提交报文有了字节级 golden 测试（`tests/golden/submit_payload.txt`）：一组固定
+  输入钉住 `objectKey`、签名原文、点位数组和 `save/record` 的每一个字节。
+  每次运行都会变的 `geeToken` 与它派生的 `signature` 在比较前抹掉，其余照比。
+  拆提交链路时可以确信「只是搬移」，红了就是搬错了。
+- `missing_docs` 设为 deny：所有公开项（含字段、变体、方法、crate 本身）
+  都有说明，以后新增的公开项没写文档直接编不过。
+- 每个源文件只保留一个 `#[cfg(test)]` 和一个测试模块 `mod tests`（放在文件
+  末尾）：16 个文件里散落的 39 个测试模块合并进去，4 个挂在单个函数上的
+  `#[cfg(test)]` 辅助项也收进测试模块。测试数量不变（531）。
+
 ### 变更
 
+- **[仅修复]** `dry_run` 的 ⑦ 自检段拆成四块：`inspect_probe`（报文反解视图交给
+  preflight）、`audit_points`（必到点齐 / `isPass` / `type=2` 三道校验）、
+  `log_point_distances`（两套坐标系最近距离与首次经过下标）、`warn_point_order`
+  （轨迹经过次序 vs 点位数组同序）。本体从约 560 行降到约 280 行。
+- **[仅修复]** `track::preflight::inspect_at` 按检查项拆成 `check_timeline` /
+  `check_point_times` / `check_distance_and_geo` / `check_checkpoints` /
+  `check_buckets` / `check_sampling` / `check_physics` / `check_totals` /
+  `check_startup` 九个函数，本体只剩「依次调用、最后拼 Report」。检查项顺序与
+  输出文案一字未改（有 golden 之外的既有断言兜底）。
+- **[仅修复]** `dry_run` 的 ⑤ 采样段提成 `sample_stage`，产出收成 `SampleStage`
+  （上报点、实测里程、仿真输入），本体再降到约 300 行。
+- **[仅修复]** `dry_run` 的①策略、②围栏、③打卡点、④规划四段各自提成
+  `stage_policy` / `stage_fence` / `stage_points` / `plan_stage`，本体从 1300
+  行降到约 560 行，只剩「按什么顺序、失败怎么降级」。日志文案和降级规则一字未改。
+- **[仅修复]** `handle_plan` 拆成三条：参数与中心点解析留在本体，联网预演的
+  响应体搬到 `respond_online`，本地合成搬到 `respond_local`。纯搬移，响应
+  JSON 一字未改。
+- **[仅修复]** 网页控制台的请求体收进 `src/web/dto/`：每个路由域一个模块
+  （run / accounts / meta / records / map_data），`body["x"].as_f64()` 这种散落
+  取值变成 DTO 的字段 + 方法。字段全用宽松反序列化，类型不对仍然是「当没填」，
+  默认值与拆前逐字相同（7 条等价测试钉住）。线上请求与响应不
+  变，改变的是「这个接口收哪些字段」有了单一出处。
+- **[仅修复]** 外部数据入口的数字强转集中到 `src/number.rs`：用户提交的
+  JSON、厂商响应、时间戳这些地方不再用裸 `as`，改成 `*_to_*` 检查函数（越界、
+  NaN 由调用方决定兜底）。像素、几何计算里的 `as` 保留——那里向零截断本来就
+  是想要的语义。`envelope::now_ms()` 返回类型从 `u128` 改为 `i64`（毫秒时间戳
+  不需要无符号），调用方少了一轮转换。
+- **[行为变化]** 命令行按错误类别分退出码（#62）：登录态 4、限频 5、网络 6、
+  厂商拒绝 7、围栏几何 8；其它失败仍是 1，用法错误仍是 2，`cheat` 的 0/2/3
+  不变。以前除用法错误外全是 1。完整表见 README「退出码」。
+- **[行为变化]** 类型化错误铺满全库（#62 第三步）：除命令行入口外，所有
+  `Result<_, String>` 换成 `Result<_, Error>`，`src/` 下不再有字符串错误签名。
+  网页接口把内部错误原样回给前端时，改用按类别定状态码的响应
+  （登录态 401 / 限频 429 / 厂商与网络 502 / 围栏点位 400 / 本机与文件 500），
+  以前这些一律是 HTTP 200 + `ok:false`。只靠状态码判断成功的前端代码要改成
+  同时看 `ok` 字段。
+- **[行为变化]** 控制台口令错误的 401 响应体新增 `"kind":"console_auth"`。
+  前端只在「401 且 kind 是 console_auth」时弹解锁框；账号登录态失效
+  （`kind:"auth"`）改为显示错误文案，不再误弹解锁框。自己写了脚本只看 401
+  的，请改看 `kind`。
+- **[行为变化]** 类型化错误第一步（#62）：新增 `src/error.rs` 的 `ErrorKind`
+  （Auth / Protocol{厂商码,说明} / Network / RateLimit / Fence / Client /
+  Storage / Json），`client.rs` 作为唯一分类点：厂商业务码在此归类
+  （`10121`→Auth、`10603`→RateLimit、其余→Protocol），传输失败归 Network。
+  本批转换 client + login / records / semester / cheat / ai 五个模块及
+  `expect_ok`；flow/submit/fence/points/policy/obs 的边界暂以 `to_string()`
+  过渡（下个 PR 转换）。**Web 控制台错误响应变化（对着控制台 API 写脚本的话
+  看这里）**：这些端点的厂商错误从一律 400 变为 401（认证）/ 429（限流）/
+  502（上游拒绝/网络），响应体新增 `kind` 字段（auth/protocol/network/
+  rate_limit/fence/client/storage/json）和 `vendor_code`（有厂商码时）；
+  厂商错误文案从「业务错误 error=…」变为结构化中文（如
+  「不在有效时段(vendor code 11016)」）。CLI 打印文本随之微调，退出码不变。
+- **[行为变化]** 配置系统重写（#53）：新增 `config.toml`（搜索 `./config.toml` →
+  `~/.pace-forge/config.toml`，或 `--config <路径>` / `PACE_CONFIG` 指定），
+  优先级 `PACE_* 环境变量 > config.toml > 默认值`。配置拆进独立 crate
+  `crates/pace-forge-config`：21 个开关（含旧清单漏掉的
+  `PACE_EXTRA_CA`/`PACE_IGNORE_DAILY_LIMIT`/`PACE_PREFER_STADIUM`/
+  `PACE_CENTER_LAT`/`PACE_CENTER_LNG`/`PACE_FIXED_POINT`/
+  `PACE_FORCE_NORMAL_POINT`）一张注册表同时服务 TOML 解析和 env 解析。
+  env 名全部保留，老用法不破。**系统性语义变更：非法值从「静默回落默认」
+  改为「启动报错」**——包括配置文件未知键（防拼写错误）、词汇外的枚举值、
+  缺一半的 `PACE_CENTER_LAT/LNG`（旧版静默忽略）。布尔开关词汇统一为
+  0/1、true/false、yes/no（大小写不敏感；旧版各键口径不一，文档里写过的
+  值行为不变）。`PACE_DUMP_POLICY` 为空串不再被当成目录名。
+  `config.example.toml` 进仓库，键参考以它为准。
+- **[行为变化]** 移除 `pace-forge config` 子命令：那张 21 行的开关表与
+  `config.example.toml` 逐字重复，没人愿意读。键参考归 docs（example.toml +
+  README 配置节）；「哪些开关非默认、来自哪一层」的运行时信息保留在 Web
+  启动日志的「非默认开关」一行。
 - **[行为变化]** 源码整体搬进 `src/`（`api/` `crypto/` `track/` `web/` 及入口文件），`data/`、`tests/`、`docs/` 位置不变；对外行为不变（#38）
 - **[行为变化]** 升到 edition 2024 + rand 0.9，并用 `rust-toolchain.toml` 把工具链钉在 1.99.1。同 seed 下 planner 与配速剖面的输出 hash 与升级前逐字节一致（#38）
 - **[行为变化]** `semester` 在 `goalMethod=2` 的学校（服务端次数恒 0）多打一行本地反算：
@@ -35,6 +116,8 @@
 
 ### 修复
 
+- **[仅修复]** `PACE_IGNORE_DAILY_LIMIT=0` 现在是「不绕过日上限」。旧实现用存在性判断（`is_ok()`），设成 `0`、`false`、空串之外的任何值都会**开启**绕过——想关都关不掉
+- **[仅修复]** `key_sources_fall_back_past_the_posix_defaults` 在没有机器标识取源的机器上（macOS：无 `/etc/machine-id`、`/etc/hostname`，未设 `COMPUTERNAME`）跳过，不再让 `cargo test` 在开发机常红
 - **[仅修复]** 打卡点回钉改为按数组次序（`pin_checkpoints_in_order`）：无序遍历会把「去 #2 途中擦过 #4」的 #4 钉在前面，首过次序变成 0,2,3,4,1，服务端按顺序判定直接失败。钉不进次序的会报出距路径多少米。**只跑过单测，夜间点位接口限流（10603）拿不到打卡点，还没真机复测。**
 - **[仅修复]** 路网 A* 对「未轮到的打卡点」改为硬禁（12m 半径，走不通再退回软罚）：原来 25m 半径 + ×5 软罚在单校主路上等于没禁，实测 5 点位仍被判首过乱序。**同上，只跑过单测。**
 - **[仅修复]** `suggest` 补一条出口建议（三个风控维度里唯一能当场查的）

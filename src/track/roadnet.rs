@@ -8,6 +8,7 @@
 
 use super::geo::{distance, m_per_deg_lat, m_per_deg_lng};
 use crate::api::session::home_dir;
+use crate::error::{Error, ErrorKind};
 use serde_json::Value;
 
 /// Overpass 端点。主站经常 502/504，准备了两个镜像轮询。
@@ -53,7 +54,7 @@ fn cooling_at(now_ms: u64, down_at_ms: u64) -> bool {
 }
 
 /// 打单个端点。
-fn post_one(host: &str, body: &str) -> Result<String, String> {
+fn post_one(host: &str, body: &str) -> Result<String, Error> {
     match ureq::post(host)
         .set("User-Agent", "pace-forge/0.1 (route planning)")
         .set("Content-Type", "application/x-www-form-urlencoded")
@@ -62,10 +63,10 @@ fn post_one(host: &str, body: &str) -> Result<String, String> {
     {
         Ok(r) => match r.into_string() {
             Ok(t) if t.contains("\"elements\"") => Ok(t),
-            Ok(_) => Err(format!("{host} 内容异常")),
-            Err(e) => Err(format!("{host} 读取失败: {e}")),
+            Ok(_) => Err(ErrorKind::network(format!("{host} 内容异常"))),
+            Err(e) => Err(ErrorKind::network(format!("{host} 读取失败: {e}"))),
         },
-        Err(e) => Err(format!("{host} 请求失败: {e}")),
+        Err(e) => Err(ErrorKind::network(format!("{host} 请求失败: {e}"))),
     }
 }
 
@@ -74,7 +75,7 @@ fn post_one(host: &str, body: &str) -> Result<String, String> {
 /// 只依赖 channel，不碰网络：测试里喂假结果就能覆盖「先到即用」「全失败」
 /// 「窗口内一个都没回」三种情形。
 fn select_first_ok(
-    rx: &std::sync::mpsc::Receiver<(usize, Result<String, String>)>,
+    rx: &std::sync::mpsc::Receiver<(usize, Result<String, Error>)>,
     window: std::time::Duration,
 ) -> (Option<String>, Vec<String>) {
     let deadline = std::time::Instant::now() + window;
@@ -86,7 +87,7 @@ fn select_first_ok(
         }
         match rx.recv_timeout(left) {
             Ok((_idx, Ok(text))) => return (Some(text), errs),
-            Ok((_idx, Err(e))) => errs.push(e),
+            Ok((_idx, Err(e))) => errs.push(e.to_string()),
             // 超时，或者所有发送端都已退出（小概率：端点比窗口先全挂）
             Err(_) => break,
         }
@@ -95,15 +96,15 @@ fn select_first_ok(
 }
 
 /// 打 Overpass：并发竞速、窗口超时、全线失败后进入冷却。
-fn overpass_post(body: &str, what: &str) -> Result<String, String> {
+fn overpass_post(body: &str, what: &str) -> Result<String, Error> {
     if cooling_at(
         now_ms_u64(),
         DOWN_AT_MS.load(std::sync::atomic::Ordering::Relaxed),
     ) {
-        return Err(format!(
+        return Err(ErrorKind::fence(format!(
             "Overpass 刚失败过，{} 分钟内不再重试（{what}）",
             DOWN_COOLDOWN_MS / 60_000
-        ));
+        )));
     }
     let (tx, rx) = std::sync::mpsc::channel();
     for (idx, host) in OVERPASS_HOSTS.iter().enumerate() {
@@ -126,10 +127,10 @@ fn overpass_post(body: &str, what: &str) -> Result<String, String> {
         .last()
         .cloned()
         .unwrap_or_else(|| "窗口内没有端点返回".into());
-    Err(format!(
+    Err(ErrorKind::network(format!(
         "所有 Overpass 端点都失败（{what}，并发竞速 {}s，最后一次: {last}）",
         RACE_WINDOW.as_secs()
-    ))
+    )))
 }
 
 /// 打算走的路类型。excluding motorway/trunk：校园里没有，且人不能跑。
@@ -139,13 +140,16 @@ const WALKABLE: &str = "footway|path|pedestrian|steps|track|service|residential|
 /// 一段路（OSM way 的几何）。
 #[derive(Debug, Clone)]
 pub struct RoadSegment {
+    /// 折线顶点（lat, lon）。
     pub points: Vec<(f64, f64)>,
+    /// OSM 的道路等级（`residential` 等）。
     pub kind: String,
 }
 
 /// 拉来的路网。
 #[derive(Debug, Clone, Default)]
 pub struct RoadNet {
+    /// 全部路段。
     pub segments: Vec<RoadSegment>,
     /// 数据来源描述，用于日志。
     pub source: String,
@@ -156,6 +160,7 @@ pub struct RoadNet {
 }
 
 impl RoadNet {
+    /// 一段路都没拉到。
     pub fn is_empty(&self) -> bool {
         self.segments.is_empty()
     }
@@ -215,7 +220,7 @@ impl RoadNet {
 ///
 /// 失败（网络、超时、限流）返回 Err，调用方退回几何规划——不能因为拿不到
 /// 路网就完全不能跑。
-pub fn fetch(bbox: (f64, f64, f64, f64)) -> Result<RoadNet, String> {
+pub fn fetch(bbox: (f64, f64, f64, f64)) -> Result<RoadNet, Error> {
     // 先看本地缓存。Overpass 主站经常 502/504，镜像也不稳，
     // 一次拉取要几十秒，缓存起来按 bbox 网格复用。
     if let Some(net) = cache_get(bbox) {
@@ -223,7 +228,7 @@ pub fn fetch(bbox: (f64, f64, f64, f64)) -> Result<RoadNet, String> {
     }
     let (min_lat, min_lon, max_lat, max_lon) = bbox;
     if !(min_lat < max_lat && min_lon < max_lon) {
-        return Err("bbox 非法".into());
+        return Err(ErrorKind::fence("bbox 非法".into()));
     }
     let query = format!(
         "[out:json][timeout:40];\
@@ -235,11 +240,12 @@ pub fn fetch(bbox: (f64, f64, f64, f64)) -> Result<RoadNet, String> {
     let body = format!("data={}", urlencode(&query));
     let text = overpass_post(&body, "路网")?;
 
-    let v: Value = serde_json::from_str(&text).map_err(|e| format!("路网 JSON 解析失败: {e}"))?;
+    let v: Value = serde_json::from_str(&text)
+        .map_err(|e| ErrorKind::fence(format!("路网 JSON 解析失败: {e}")))?;
     let elements = v
         .get("elements")
         .and_then(|e| e.as_array())
-        .ok_or("路网响应缺少 elements")?;
+        .ok_or_else(|| ErrorKind::fence("路网响应缺少 elements".into()))?;
 
     let mut segments = Vec::new();
     for el in elements {
@@ -272,7 +278,7 @@ pub fn fetch(bbox: (f64, f64, f64, f64)) -> Result<RoadNet, String> {
     }
 
     if segments.is_empty() {
-        return Err("该区域 OSM 里没有可用道路".into());
+        return Err(ErrorKind::fence("该区域 OSM 里没有可用道路".into()));
     }
 
     let net = RoadNet {
@@ -369,7 +375,7 @@ fn cache_put_in(base: &std::path::Path, bbox: (f64, f64, f64, f64), net: &RoadNe
 ///
 /// 蛇形填充是纯几何的，不知道哪里有水，轨迹就直接从湖面上穿过去。
 /// 拿到水域多边形后，扫描时在这些区域挖洞。
-pub fn fetch_water(bbox: (f64, f64, f64, f64)) -> Result<Vec<Vec<(f64, f64)>>, String> {
+pub fn fetch_water(bbox: (f64, f64, f64, f64)) -> Result<Vec<Vec<(f64, f64)>>, Error> {
     if let Some(w) = water_cache_get(bbox) {
         return Ok(w);
     }
@@ -379,7 +385,8 @@ pub fn fetch_water(bbox: (f64, f64, f64, f64)) -> Result<Vec<Vec<(f64, f64)>>, S
     );
     let body = format!("data={}", urlencode(&query));
     let text = overpass_post(&body, "水域")?;
-    let v: Value = serde_json::from_str(&text).map_err(|e| format!("水域 JSON 解析失败: {e}"))?;
+    let v: Value = serde_json::from_str(&text)
+        .map_err(|e| ErrorKind::fence(format!("水域 JSON 解析失败: {e}")))?;
     let mut polys = Vec::new();
     if let Some(els) = v.get("elements").and_then(|e| e.as_array()) {
         for el in els {
@@ -436,14 +443,14 @@ fn load_local_blockers_in(base: &std::path::Path) -> Vec<Vec<(f64, f64)>> {
 }
 
 /// 保存本地禁区。
-pub fn save_local_blockers(polys: &[Vec<(f64, f64)>]) -> Result<(), String> {
+pub fn save_local_blockers(polys: &[Vec<(f64, f64)>]) -> Result<(), Error> {
     save_local_blockers_in(&home_dir(), polys)
 }
 
 /// 同上，但 HOME 基目录由调用方指定。
 ///
 /// 首次运行（`~/.pace-forge/` 还不存在）时由 `write_file_private` 建目录。
-fn save_local_blockers_in(base: &std::path::Path, polys: &[Vec<(f64, f64)>]) -> Result<(), String> {
+fn save_local_blockers_in(base: &std::path::Path, polys: &[Vec<(f64, f64)>]) -> Result<(), Error> {
     let path = blockers_path_in(base);
     let body = serde_json::json!({
         "polys": polys
@@ -452,7 +459,7 @@ fn save_local_blockers_in(base: &std::path::Path, polys: &[Vec<(f64, f64)>]) -> 
             .collect::<Vec<_>>()
     });
     crate::api::session::write_file_private(&path, body.to_string().as_bytes())
-        .map_err(|e| format!("写文件失败: {e}"))
+        .map_err(|e| ErrorKind::client(format!("写文件失败: {e}")))
 }
 
 fn blockers_path_in(base: &std::path::Path) -> std::path::PathBuf {
@@ -464,7 +471,7 @@ fn blockers_path_in(base: &std::path::Path) -> std::path::PathBuf {
 /// 路网数据不足时的兜底是「把打卡点按顺序用弧线串起来」——纯几何，不看楼。
 /// 实测校区里 5 个打卡点分属不同楼群，串出来的弧直接从教学楼、宿舍楼中间
 /// 穿过去，地图上一眼就假。拿到轮廓后由 fence_route::avoid_blockers 做避让。
-pub fn fetch_buildings(bbox: (f64, f64, f64, f64)) -> Result<Vec<Vec<(f64, f64)>>, String> {
+pub fn fetch_buildings(bbox: (f64, f64, f64, f64)) -> Result<Vec<Vec<(f64, f64)>>, Error> {
     if let Some(b) = poly_cache_get(bbox, "buildings") {
         return Ok(b);
     }
@@ -478,10 +485,11 @@ pub fn fetch_buildings(bbox: (f64, f64, f64, f64)) -> Result<Vec<Vec<(f64, f64)>
 }
 
 /// Overpass 拉 polygon 的公共部分（水体、建筑共用）。
-fn fetch_polys(query: &str, what: &str) -> Result<Vec<Vec<(f64, f64)>>, String> {
+fn fetch_polys(query: &str, what: &str) -> Result<Vec<Vec<(f64, f64)>>, Error> {
     let body = format!("data={}", urlencode(query));
     let text = overpass_post(&body, what)?;
-    let v: Value = serde_json::from_str(&text).map_err(|e| format!("{what} JSON 解析失败: {e}"))?;
+    let v: Value = serde_json::from_str(&text)
+        .map_err(|e| ErrorKind::fence(format!("{what} JSON 解析失败: {e}")))?;
     let mut polys = Vec::new();
     if let Some(els) = v.get("elements").and_then(|e| e.as_array()) {
         for el in els {
@@ -647,7 +655,9 @@ fn urlencode(s: &str) -> String {
 /// 一条走出来的路线。
 #[derive(Debug, Clone)]
 pub struct RoadRoute {
+    /// 路线折线（lat, lon）。
     pub points: Vec<(f64, f64)>,
+    /// 路线长度（米）。
     pub length_m: f64,
     /// 走过的路段数。
     pub legs: usize,
@@ -664,7 +674,7 @@ pub fn route_on_roads(
     must: &[(f64, f64)],
     want_m: f64,
     seed: u64,
-) -> Result<RoadRoute, String> {
+) -> Result<RoadRoute, Error> {
     route_on_roads_with(net, start_hint, must, want_m, seed, 250.0)
 }
 
@@ -673,6 +683,10 @@ pub fn route_on_roads(
 /// OSM 的段是完整 way，端点未必严格相接，250m 的宽容度能多串一些路；
 /// 而瓦片路网是像素骨架提出的碎片，只保留真正连通的段——宽容度给大了
 /// 就会跨着空地跳，`route_on_roads` 输出过 119m 的瞬移。
+#[expect(
+    clippy::unwrap_used,
+    reason = "non-empty is guaranteed by the guard above"
+)]
 pub fn route_on_roads_with(
     net: &RoadNet,
     start_hint: (f64, f64),
@@ -680,12 +694,12 @@ pub fn route_on_roads_with(
     want_m: f64,
     seed: u64,
     max_hop_m: f64,
-) -> Result<RoadRoute, String> {
+) -> Result<RoadRoute, Error> {
     if net.is_empty() {
-        return Err("路网为空".into());
+        return Err(ErrorKind::fence("路网为空".into()));
     }
     if want_m <= 0.0 {
-        return Err("目标里程必须为正".into());
+        return Err(ErrorKind::fence("目标里程必须为正".into()));
     }
 
     // 所有段的索引
@@ -776,6 +790,10 @@ pub fn route_on_roads_with(
 
         // 接上这一段
         for &p in pts.iter().skip(1) {
+            #[expect(
+                clippy::unwrap_used,
+                reason = "non-empty is guaranteed by the guard above"
+            )]
             let d = distance(*points.last().unwrap(), p);
             if total + d > want_m {
                 break;
@@ -796,7 +814,7 @@ pub fn route_on_roads_with(
     }
 
     if points.len() < 2 {
-        return Err("路网上没走出有效路线".into());
+        return Err(ErrorKind::fence("路网上没走出有效路线".into()));
     }
 
     // 文档承诺「经过所有 must 点」，实现却只在轨迹经过 30m 内时把点从
@@ -814,11 +832,11 @@ pub fn route_on_roads_with(
                     .fold(f64::INFINITY, f64::min)
             })
             .fold(0.0f64, f64::max);
-        return Err(format!(
+        return Err(ErrorKind::fence(format!(
             "路网规划漏了 {} 个打卡点（最近点距 {:.0}m，要求 <30m）",
             pending.len(),
             worst
-        ));
+        )));
     }
 
     Ok(RoadRoute {
@@ -897,7 +915,8 @@ mod tests {
     #[test]
     fn race_returns_first_success_without_waiting() {
         let (tx, rx) = std::sync::mpsc::channel();
-        tx.send((0, Err("主站 502".to_string()))).unwrap();
+        tx.send((0, Err(ErrorKind::fence("主站 502".into()))))
+            .unwrap();
         tx.send((1, Ok("{\"elements\":[]}".to_string()))).unwrap();
         // 故意不 drop(tx)：还有一个「慢端点」没回，竞速不能等它。
         let t0 = std::time::Instant::now();
@@ -915,20 +934,22 @@ mod tests {
     #[test]
     fn race_collects_errors_when_all_fail() {
         let (tx, rx) = std::sync::mpsc::channel();
-        tx.send((0, Err("a 超时".to_string()))).unwrap();
-        tx.send((1, Err("b 502".to_string()))).unwrap();
-        tx.send((2, Err("c 内容异常".to_string()))).unwrap();
+        tx.send((0, Err(ErrorKind::fence("a 超时".into()))))
+            .unwrap();
+        tx.send((1, Err(ErrorKind::fence("b 502".into())))).unwrap();
+        tx.send((2, Err(ErrorKind::network("c 内容异常".into()))))
+            .unwrap();
         drop(tx);
         let (ok, errs) = select_first_ok(&rx, std::time::Duration::from_secs(1));
         assert!(ok.is_none());
         assert_eq!(errs.len(), 3);
-        assert_eq!(errs.last().unwrap(), "c 内容异常");
+        assert_eq!(errs.last().unwrap(), "网络错误：c 内容异常");
     }
 
     /// 竞速：窗口到期一个结果都没有，要按时退出，不能死等。
     #[test]
     fn race_times_out_at_window() {
-        let (_tx, rx) = std::sync::mpsc::channel::<(usize, Result<String, String>)>();
+        let (_tx, rx) = std::sync::mpsc::channel::<(usize, Result<String, Error>)>();
         let t0 = std::time::Instant::now();
         let (ok, errs) = select_first_ok(&rx, std::time::Duration::from_millis(120));
         assert!(ok.is_none() && errs.is_empty());
@@ -1004,7 +1025,7 @@ mod tests {
         let err = route_on_roads(&net, (lat0, lon0), &must, 120.0, 7)
             .expect_err("漏打卡必须报错，不能静默 Ok");
         assert!(
-            err.contains("漏了") && err.contains("打卡点"),
+            err.to_string().contains("漏了") && err.to_string().contains("打卡点"),
             "错误信息要说清是漏点，实际: {err}"
         );
     }

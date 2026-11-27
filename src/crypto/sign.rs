@@ -101,6 +101,7 @@ pub fn original_sign(fields: &SignFields) -> String {
         .join("&")
 }
 
+/// 给运动接口的请求字段签名（固定盐）。
 pub fn sport_signature(fields: &SignFields) -> String {
     sign_with_salt(fields, SIGN_SALT)
 }

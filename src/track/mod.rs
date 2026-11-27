@@ -155,6 +155,8 @@ pub fn cap_advances(adv: &mut [f64], caps: &[f64], total: f64) {
     }
 }
 
+/// 原地压缩起步窗口：把窗口内采样点的里程压到全程的约 1.1%，
+/// 后面的点顺延补上，末点仍钉在总长。
 pub fn compress_startup(
     pts: &mut [TrackPoint],
     start_ms: i64,
@@ -723,7 +725,11 @@ fn chord_hits_blocker(a: (f64, f64), b: (f64, f64), blockers: &[Vec<(f64, f64)>]
 // 8 个参数看着多，但每一项都是独立的物理/轨控输入（几何、时间轴、噪声种子、
 // 速度剖面、上下限、障碍、打卡点）。打包成结构体只会把这些直白的调用点
 // 变成一行字面量，读起来更绕。
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the parameters mirror the fields of the sampled track; see
+    `sample_by_time` for what each one controls"
+)]
 pub fn sample_by_time(
     path: &[(f64, f64)],
     times_ms: &[i64],
@@ -1057,6 +1063,7 @@ pub struct CheckpointSnap {
 /// 一批吸附的汇总。
 #[derive(Debug, Clone, Default)]
 pub struct SnapReport {
+    /// 每个打卡点的吸附结果。
     pub items: Vec<CheckpointSnap>,
     /// 吸附后相邻采样点的最大间距（米）——用来确认没把轨迹扯出 `GEO_JUMP`。
     pub max_gap_m: f64,
@@ -1378,8 +1385,13 @@ pub fn queue_num(pos: usize, n: usize, startup: usize) -> i32 {
 }
 
 #[cfg(test)]
-mod window_tests {
+mod tests {
+    use super::queue_num;
     use super::*;
+    use crate::api::submit::{SubmitParams, build, verify_view};
+    use crate::error::Error;
+    use crate::track::preflight::{Check, inspect};
+    use rand::SeedableRng;
 
     /// 本地诊断（issue #4）：起步窗口在 555 / 1200 / 1800 秒三个时长下的
     /// 数学结果，不用账号、不提交。调窗口口径前先看这张表，别拿真机试。
@@ -1432,11 +1444,8 @@ mod window_tests {
             assert!(startup_m > 0.0 && first_pace_min > rest_pace_min);
         }
     }
-}
 
-#[cfg(test)]
-mod nudge_tests {
-    use super::*;
+    // ---- merged from former `mod nudge_tests` ----
 
     /// 一条带拐角的密折线，规模贴近真实：总长 30m（= 两段 5 秒上报间隔），
     /// 中间向北凸出 8m。真实场景里 5 秒采样的相邻点隔 15m 左右，拐角切掉的
@@ -1543,21 +1552,18 @@ mod nudge_tests {
         // 阈值大于实际偏离（8m）就不动
         assert_eq!(nudge_to_corners(&mut pts, &dense, 9.0), 0);
     }
-}
 
-#[cfg(test)]
-mod queue_num_tests {
-    //! `queueNum` 的逐元素对拍（`docs/audit/AUDIT-round.md` A5）。
-    //!
-    //! 旧断言只断首尾（`sp[0]==0`、`sp.last()==24`），中间 22/55 个桶、14/114 个
-    //! 点的偏移全部漏过。这里把真机两套序列整段写进测试，逐下标比：
-    //!
-    //! - 桶（55 个）：**完全相等**，一个下标都不许差；
-    //! - 点（114 个）：除 `107`、`111` 两个尾部下标（真机 22/23 档各占 5/4 个点、
-    //!   24 档只占 2 个点，等宽网格给 4/4/3）外完全相等；这两处单独列出
-    //!   期望值，不做「区间」或「大体一致」的放宽。
+    // ---- merged from former `mod queue_num_tests` ----
 
-    use super::queue_num;
+    // `queueNum` 的逐元素对拍（`docs/audit/AUDIT-round.md` A5）。
+    //
+    // 旧断言只断首尾（`sp[0]==0`、`sp.last()==24`），中间 22/55 个桶、14/114 个
+    // 点的偏移全部漏过。这里把真机两套序列整段写进测试，逐下标比：
+    //
+    // - 桶（55 个）：**完全相等**，一个下标都不许差；
+    // - 点（114 个）：除 `107`、`111` 两个尾部下标（真机 22/23 档各占 5/4 个点、
+    //   24 档只占 2 个点，等宽网格给 4/4/3）外完全相等；这两处单独列出
+    //   期望值，不做「区间」或「大体一致」的放宽。
 
     /// 真机 `raw_points[i].queueNum`（rrid 1328288734，114 点 / 555 秒 / 1683.83m）。
     ///
@@ -1692,26 +1698,20 @@ mod queue_num_tests {
         assert_eq!(queue_num(9, 10, 9), 0, "n<=startup+1 时整场都在起步段");
         assert_eq!(queue_num(100, 45, 19), 24, "超过第 24 档必须封顶");
     }
-}
 
-#[cfg(test)]
-mod checkpoint_hit_tests {
-    //! 回归：**压缩之后**打卡点必须仍然被精确命中。
-    //!
-    //! 守的是那个把整条提交链打断的回归：`compress_startup` 对所有点（含窗口
-    //! 外的点）按目标弧长重铺，把 `planner::plan` / `fence_route::
-    //! resample_with_checkpoints` 钉在打卡点上的那批顶点移走，残距从 0.000m
-    //! 变成 0.33~2.24m，`preflight::CP_MISS`（0.5m，Fatal）当场阻断，
-    //! `flow::run_full` 第一句 `dry_run(...)?` 直接返回 Err —— 有必到点的跑
-    //! 一单都发不出去。
-    //!
-    //! 五个点位取自真机 `fixed_point_json` 的 BD-09 坐标，与审计
-    //! （docs/audit/AUDIT-round.md A1）用同一组数据，改前改后的数字可以直接对。
+    // ---- merged from former `mod checkpoint_hit_tests` ----
 
-    use super::*;
-    use crate::api::submit::{SubmitParams, build, verify_view};
-    use crate::track::preflight::{Check, inspect};
-    use rand::SeedableRng;
+    // 回归：**压缩之后**打卡点必须仍然被精确命中。
+    //
+    // 守的是那个把整条提交链打断的回归：`compress_startup` 对所有点（含窗口
+    // 外的点）按目标弧长重铺，把 `planner::plan` / `fence_route::
+    // resample_with_checkpoints` 钉在打卡点上的那批顶点移走，残距从 0.000m
+    // 变成 0.33~2.24m，`preflight::CP_MISS`（0.5m，Fatal）当场阻断，
+    // `flow::run_full` 第一句 `dry_run(...)?` 直接返回 Err —— 有必到点的跑
+    // 一单都发不出去。
+    //
+    // 五个点位取自真机 `fixed_point_json` 的 BD-09 坐标，与审计
+    // （docs/audit/AUDIT-round.md A1）用同一组数据，改前改后的数字可以直接对。
 
     const START_MS: i64 = 1_790_913_882_164;
 
@@ -1747,7 +1747,7 @@ mod checkpoint_hit_tests {
         dur: i64,
         seed: u64,
         snap: bool,
-    ) -> Result<(Vec<TrackPoint>, i64, SnapReport), String> {
+    ) -> Result<(Vec<TrackPoint>, i64, SnapReport), Error> {
         let req = PlanRequest {
             center_lat: 47.3801,
             center_lng: 103.9521,
@@ -2149,7 +2149,7 @@ mod checkpoint_hit_tests {
                         // 只允许「装不下」这一种：闭环最短 2109m，1000/1683 两组
                         // 本来就塞不进 5 个点位。若哪天变成别的错，这里会失败。
                         assert!(
-                            e.contains("装不下"),
+                            e.to_string().contains("装不下"),
                             "planner dist={dist} dur={dur} seed={seed} 出现预期外的错误：{e}"
                         );
                     }
@@ -2315,15 +2315,12 @@ mod checkpoint_hit_tests {
             pipeline(&cps, 2000.0, 700, 2026, false).unwrap().0.len()
         );
     }
-}
 
-#[cfg(test)]
-mod gap_clamp_tests {
-    //! 吸附打卡点后把被拉开的间距压回速度上限。
+    // ---- merged from former `mod gap_clamp_tests` ----
 
-    use super::*;
+    // 吸附打卡点后把被拉开的间距压回速度上限。
 
-    fn tp(lat: f64, lon: f64) -> TrackPoint {
+    fn tp_gap_clamp_tests(lat: f64, lon: f64) -> TrackPoint {
         TrackPoint {
             lat,
             lon,
@@ -2335,7 +2332,7 @@ mod gap_clamp_tests {
     fn line(n: usize, step_m: f64) -> Vec<TrackPoint> {
         let mlat = geo::M_PER_DEG_LAT;
         (0..n)
-            .map(|i| tp(47.38 + (i as f64 * step_m) / mlat, 123.95))
+            .map(|i| tp_gap_clamp_tests(47.38 + (i as f64 * step_m) / mlat, 123.95))
             .collect()
     }
 
@@ -2388,20 +2385,17 @@ mod gap_clamp_tests {
             assert!(g <= 31.6, "第 {i} 段仍有 {g:.2}m，没收敛");
         }
     }
-}
 
-#[cfg(test)]
-mod sample_rate_tests {
-    //! 上报采样节奏：与真机对象 `evidence/obs_real_20261002.json`
-    //! （114 点 / 555 秒 / 1683.83m）逐项对照。
-    //!
-    //! 守的是「采样率是真机三倍」那个偏差：真机 `ΔtotalTime` 109/113 恰好
-    //! 5 秒（均值 4.9115）、`ΔtotalDis` 均值 14.90 米；按距离 5m/点采样会
-    //! 出 337 点、1.65 秒/点。这里不看「看起来像」，直接比点数和两个平均间隔。
+    // ---- merged from former `mod sample_rate_tests` ----
 
-    use super::*;
+    // 上报采样节奏：与真机对象 `evidence/obs_real_20261002.json`
+    // （114 点 / 555 秒 / 1683.83m）逐项对照。
+    //
+    // 守的是「采样率是真机三倍」那个偏差：真机 `ΔtotalTime` 109/113 恰好
+    // 5 秒（均值 4.9115）、`ΔtotalDis` 均值 14.90 米；按距离 5m/点采样会
+    // 出 337 点、1.65 秒/点。这里不看「看起来像」，直接比点数和两个平均间隔。
 
-    const START_MS: i64 = 1_790_913_882_164;
+    const START_MS_SAMPLE_RATE_TESTS: i64 = 1_790_913_882_164;
     const REAL_POINTS: usize = 114;
     const REAL_MEAN_DT: f64 = 4.9115;
     const REAL_MEAN_DD: f64 = 14.90;
@@ -2420,11 +2414,11 @@ mod sample_rate_tests {
     /// 走一遍生产链路的那一段：等时间采样 → 起步压平。
     fn run_cadence(interval: f64) -> (Vec<TrackPoint>, CadenceStats) {
         let path = oval_1683();
-        let times = sample_times(555, START_MS, interval);
+        let times = sample_times(555, START_MS_SAMPLE_RATE_TESTS, interval);
         let mut track = sample_by_time(
             &path,
             &times,
-            START_MS as u64,
+            START_MS_SAMPLE_RATE_TESTS as u64,
             &kinematics::KinParams::default(),
             1.0,
             8.0,
@@ -2432,7 +2426,7 @@ mod sample_rate_tests {
             &[],
         );
         assert!(track.len() >= 2, "采样为空");
-        compress_startup(&mut track, START_MS, 555, None);
+        compress_startup(&mut track, START_MS_SAMPLE_RATE_TESTS, 555, None);
         let st = cadence_stats(&track);
         (track, st)
     }
@@ -2440,7 +2434,7 @@ mod sample_rate_tests {
     /// 时间轴本身的形状（点数、间隔、起步额外点）。
     #[test]
     fn time_grid_matches_real_device_shape() {
-        let t = sample_times(555, START_MS, SAMPLE_INTERVAL_SEC);
+        let t = sample_times(555, START_MS_SAMPLE_RATE_TESTS, SAMPLE_INTERVAL_SEC);
         // 真机 114 点里有一个 `totalTime` 与首点完全相同的重复点，
         // 严格递增的发不出去，所以我们是 113（少 1 个）。
         assert_eq!(
@@ -2450,7 +2444,10 @@ mod sample_rate_tests {
         );
         // 真机前三点是 0 / 0 / 3（两个点同一秒）。我们保留 0 / 3，
         // 丢掉那个发不出去的重复 0。
-        let rel: Vec<i64> = t.iter().map(|x| (x - START_MS) / 1000).collect();
+        let rel: Vec<i64> = t
+            .iter()
+            .map(|x| (x - START_MS_SAMPLE_RATE_TESTS) / 1000)
+            .collect();
         assert_eq!(&rel[..5], &[0, 3, 8, 13, 18], "真机前三点 0/0/3 → 我们 0/3");
         assert_eq!(*rel.last().unwrap(), 555, "末点必须精确落在 totalTime");
         // 时间戳必须严格递增（preflight 的 TRACK_TIME_ORDER）
@@ -2486,7 +2483,7 @@ mod sample_rate_tests {
         );
         // 起步窗口 18 个点（真机 19，差的正是那个发不出去的重复 0）
         assert_eq!(
-            startup_point_count(&t, START_MS, 555),
+            startup_point_count(&t, START_MS_SAMPLE_RATE_TESTS, 555),
             18,
             "起步窗口应为 18 点（真机 19，含重复 0）"
         );
@@ -2496,9 +2493,9 @@ mod sample_rate_tests {
     #[test]
     fn tail_never_emits_a_one_or_two_second_gap() {
         for total in [4i64, 10, 15, 19, 20, 21, 32, 100, 301, 555, 720, 1800, 3601] {
-            let t = sample_times(total, START_MS, SAMPLE_INTERVAL_SEC);
+            let t = sample_times(total, START_MS_SAMPLE_RATE_TESTS, SAMPLE_INTERVAL_SEC);
             assert_eq!(
-                (*t.last().unwrap() - START_MS) / 1000,
+                (*t.last().unwrap() - START_MS_SAMPLE_RATE_TESTS) / 1000,
                 total,
                 "总时长 {total} 的末点必须精确落在 totalTime"
             );
@@ -2603,14 +2600,14 @@ mod sample_rate_tests {
         let (track, _) = run_cadence(SAMPLE_INTERVAL_SEC);
         let n = track.len();
         let times: Vec<i64> = track.iter().map(|p| p.time_ms).collect();
-        let su = startup_point_count(&times, START_MS, 555);
+        let su = startup_point_count(&times, START_MS_SAMPLE_RATE_TESTS, 555);
         assert_eq!(
             (n, su),
             (113, 18),
             "点数/起步点数必须先对上 5 秒网格（真机 114/19 含重复 0）"
         );
         let ours: Vec<i32> = (0..n).map(|i| queue_num(i, n, su)).collect();
-        let real = &super::queue_num_tests::REAL_POINT_QUEUE;
+        let real = &super::tests::REAL_POINT_QUEUE;
         // 真机第 0、1 点时间戳相同（都是 0 秒），我们是 0 秒 / 3 秒，
         // 所以下标要错一位对。
         let diffs: Vec<(usize, i32, i32)> = (0..n)
@@ -2639,25 +2636,25 @@ mod sample_rate_tests {
     #[test]
     fn compress_startup_keeps_speed_spacing_outside_window() {
         let path = oval_1683();
-        let times = sample_times(555, START_MS, SAMPLE_INTERVAL_SEC);
+        let times = sample_times(555, START_MS_SAMPLE_RATE_TESTS, SAMPLE_INTERVAL_SEC);
         let raw = sample_by_time(
             &path,
             &times,
-            START_MS as u64,
+            START_MS_SAMPLE_RATE_TESTS as u64,
             &kinematics::KinParams::default(),
             1.0,
             8.0,
             &[],
             &[],
         );
-        let k = startup_point_count(&times, START_MS, 555);
+        let k = startup_point_count(&times, START_MS_SAMPLE_RATE_TESTS, 555);
         assert_eq!(k, 18);
         let d_before: Vec<f64> = raw
             .windows(2)
             .map(|w| geo::distance((w[0].lat, w[0].lon), (w[1].lat, w[1].lon)))
             .collect();
         let mut after = raw.clone();
-        compress_startup(&mut after, START_MS, 555, None);
+        compress_startup(&mut after, START_MS_SAMPLE_RATE_TESTS, 555, None);
         let d_after: Vec<f64> = after
             .windows(2)
             .map(|w| geo::distance((w[0].lat, w[0].lon), (w[1].lat, w[1].lon)))
@@ -2756,14 +2753,17 @@ mod sample_rate_tests {
             .map(|i| TrackPoint {
                 lat: lat0 + i as f64 * step_m / mlat,
                 lon: lng0,
-                time_ms: START_MS + (i as i64 * 555_000 / (n as i64 - 1)),
+                time_ms: START_MS_SAMPLE_RATE_TESTS + (i as i64 * 555_000 / (n as i64 - 1)),
             })
             .collect();
         // 不 panic 即为通过；压完还要保住首末点与时长
-        compress_startup(&mut pts, START_MS, 555, None);
+        compress_startup(&mut pts, START_MS_SAMPLE_RATE_TESTS, 555, None);
         assert_eq!(pts.len(), n);
-        assert_eq!(pts.first().unwrap().time_ms, START_MS);
-        assert_eq!(pts.last().unwrap().time_ms, START_MS + 555_000);
+        assert_eq!(pts.first().unwrap().time_ms, START_MS_SAMPLE_RATE_TESTS);
+        assert_eq!(
+            pts.last().unwrap().time_ms,
+            START_MS_SAMPLE_RATE_TESTS + 555_000
+        );
     }
 
     /// `cap_advances` 基本盘：削峰、顺延、保总量、保单调。
@@ -2818,25 +2818,25 @@ mod sample_rate_tests {
             pts.push(TrackPoint {
                 lat: lat0 + arc / mlat,
                 lon: lng0,
-                time_ms: START_MS + i as i64 * 4910,
+                time_ms: START_MS_SAMPLE_RATE_TESTS + i as i64 * 4910,
             });
         }
         let total_before = pts
             .windows(2)
             .map(|w| geo::distance((w[0].lat, w[0].lon), (w[1].lat, w[1].lon)))
             .sum::<f64>();
-        compress_startup(&mut pts, START_MS, 555, Some(4.76));
+        compress_startup(&mut pts, START_MS_SAMPLE_RATE_TESTS, 555, Some(4.76));
         // 起步窗口（前 startup_point_count 个点）弧长被压平是设计行为，只查窗口外
         let su = startup_point_count(
             &pts.iter().map(|p| p.time_ms).collect::<Vec<_>>(),
-            START_MS,
+            START_MS_SAMPLE_RATE_TESTS,
             555,
         );
         let vmax = 4.76f64;
         for w in pts.windows(2).enumerate().skip(su.saturating_sub(1)) {
             let (i, w) = w;
-            let dt = (((w[1].time_ms - START_MS) as f64 / 1000.0).floor()
-                - ((w[0].time_ms - START_MS) as f64 / 1000.0).floor())
+            let dt = (((w[1].time_ms - START_MS_SAMPLE_RATE_TESTS) as f64 / 1000.0).floor()
+                - ((w[0].time_ms - START_MS_SAMPLE_RATE_TESTS) as f64 / 1000.0).floor())
             .max(1.0);
             let step = geo::distance((w[0].lat, w[0].lon), (w[1].lat, w[1].lon));
             assert!(
@@ -2919,17 +2919,30 @@ mod sample_rate_tests {
         );
         let blockers = vec![building.clone()];
         let total = geo::path_length(&path);
-        let times = sample_times((total / 3.0) as i64, START_MS, SAMPLE_INTERVAL_SEC);
+        let times = sample_times(
+            (total / 3.0) as i64,
+            START_MS_SAMPLE_RATE_TESTS,
+            SAMPLE_INTERVAL_SEC,
+        );
         let kin = kinematics::KinParams::default();
 
         // 不给障碍：两条弦直接从楼里穿过去
-        let naive = sample_by_time(&path, &times, START_MS as u64, &kin, 0.5, 10.0, &[], &[]);
+        let naive = sample_by_time(
+            &path,
+            &times,
+            START_MS_SAMPLE_RATE_TESTS as u64,
+            &kin,
+            0.5,
+            10.0,
+            &[],
+            &[],
+        );
         let before = chords_hit(&naive, &blockers);
         // 给障碍：补点绕开，一条都不许穿
         let guarded = sample_by_time(
             &path,
             &times,
-            START_MS as u64,
+            START_MS_SAMPLE_RATE_TESTS as u64,
             &kin,
             0.5,
             10.0,
@@ -3034,13 +3047,26 @@ mod sample_rate_tests {
 
         // 5 秒采样（3 m/s → 15m 一点）
         let total = geo::path_length(&path);
-        let times = sample_times((total / 3.0) as i64, START_MS, SAMPLE_INTERVAL_SEC);
+        let times = sample_times(
+            (total / 3.0) as i64,
+            START_MS_SAMPLE_RATE_TESTS,
+            SAMPLE_INTERVAL_SEC,
+        );
         let kin = kinematics::KinParams::default();
-        let naive = sample_by_time(&path, &times, START_MS as u64, &kin, 0.5, 10.0, &[], &[]);
+        let naive = sample_by_time(
+            &path,
+            &times,
+            START_MS_SAMPLE_RATE_TESTS as u64,
+            &kin,
+            0.5,
+            10.0,
+            &[],
+            &[],
+        );
         let guarded = sample_by_time(
             &path,
             &times,
-            START_MS as u64,
+            START_MS_SAMPLE_RATE_TESTS as u64,
             &kin,
             0.5,
             10.0,
@@ -3121,12 +3147,12 @@ mod sample_rate_tests {
             .windows(2)
             .filter(|w| chord_hits_blocker(w[0], w[1], &blockers))
             .count();
-        let times = sample_times(67, START_MS, SAMPLE_INTERVAL_SEC);
+        let times = sample_times(67, START_MS_SAMPLE_RATE_TESTS, SAMPLE_INTERVAL_SEC);
         let kin = kinematics::KinParams::default();
         let guarded = sample_by_time(
             &avoided,
             &times,
-            START_MS as u64,
+            START_MS_SAMPLE_RATE_TESTS as u64,
             &kin,
             0.5,
             10.0,
@@ -3161,11 +3187,15 @@ mod sample_rate_tests {
             path.push((lat0 + i as f64 / mlat, lng0 + i as f64 / mlng));
         }
         let total = geo::path_length(&path);
-        let times = sample_times((total / 3.0) as i64, START_MS, SAMPLE_INTERVAL_SEC);
+        let times = sample_times(
+            (total / 3.0) as i64,
+            START_MS_SAMPLE_RATE_TESTS,
+            SAMPLE_INTERVAL_SEC,
+        );
         let track = sample_by_time(
             &path,
             &times,
-            START_MS as u64,
+            START_MS_SAMPLE_RATE_TESTS as u64,
             &kinematics::KinParams::default(),
             0.5,
             10.0,

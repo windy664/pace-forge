@@ -9,6 +9,7 @@
 //! 数组，也可以是 `{"records":[...]}`；每条记录的字段名按常见别名挑，
 //! 轨迹可选（没有轨迹就算不了重合度）。
 
+use crate::error::{Error, ErrorKind};
 use serde_json::Value;
 
 /// 本地时区偏移（秒），复用 OBS key 与时间戳那一套口径。
@@ -21,19 +22,18 @@ pub fn tz_offset_sec() -> i64 {
 /// 日期和「起跑时刻」的小时都由这个偏移推出来，输出不带来源的话，换个时区
 /// 跑同一个文件会得到另一个「事实」，而人看不出是环境变了。
 pub fn tz_description() -> String {
-    let offset = tz_offset_sec();
+    let cfg = crate::config::global();
+    let offset = cfg.network.tz_offset_sec;
     let sign = if offset >= 0 { '+' } else { '-' };
     let abs = offset.abs();
     let label = format!("UTC{sign}{:02}:{:02}", abs / 3600, (abs % 3600) / 60);
-    match std::env::var("PACE_TZ_OFFSET_SEC") {
-        Ok(raw) if raw.parse::<i64>() != Ok(offset) => {
-            format!("{label}（PACE_TZ_OFFSET_SEC 无效，用默认）")
+    // 非法值在配置加载时就报错了，这里只剩「来自哪一层」要交代
+    match cfg.sources.get("network.tz_offset_sec") {
+        Some(crate::config::Source::Env) => format!("{label}（PACE_TZ_OFFSET_SEC={offset}）"),
+        Some(crate::config::Source::Toml) => {
+            format!("{label}（config.toml network.tz_offset_sec={offset}）")
         }
-        Ok(raw) if offset == 8 * 3600 => {
-            format!("{label}（PACE_TZ_OFFSET_SEC={raw}，与默认一致）")
-        }
-        Ok(raw) => format!("{label}（PACE_TZ_OFFSET_SEC={raw}）"),
-        Err(_) => format!("{label}（PACE_TZ_OFFSET_SEC 未设，用默认）"),
+        _ => format!("{label}（默认）"),
     }
 }
 
@@ -75,7 +75,9 @@ pub fn calendar_span(first_ms: i64, last_ms: i64, tz_offset_sec: i64) -> i64 {
 pub struct RunRecord {
     /// 起跑时间，毫秒戳
     pub start_ms: i64,
+    /// 里程（米）。
     pub distance_m: f64,
+    /// 用时（秒）。
     pub duration_sec: i64,
     /// 轨迹（BD-09 / WGS84 都行，只要同一批记录口径一致）
     pub track: Vec<(f64, f64)>,
@@ -154,7 +156,9 @@ pub fn parse_records(v: &Value) -> Vec<RunRecord> {
                 start *= 1000.0;
             }
             let distance_m = num(r, &["totalDis", "distance", "totalDistance", "dis"])?;
-            let duration_sec = num(r, &["totalTime", "duration", "useTime"]).unwrap_or(0.0) as i64;
+            let duration_sec = num(r, &["totalTime", "duration", "useTime"])
+                .and_then(crate::number::f64_to_i64)
+                .unwrap_or(0);
             let track = r
                 .get("points")
                 .or_else(|| r.get("allLocJson"))
@@ -162,7 +166,7 @@ pub fn parse_records(v: &Value) -> Vec<RunRecord> {
                 .map(parse_track)
                 .unwrap_or_default();
             Some(RunRecord {
-                start_ms: start as i64,
+                start_ms: crate::number::f64_to_i64(start).unwrap_or(0),
                 distance_m,
                 duration_sec,
                 track,
@@ -173,20 +177,26 @@ pub fn parse_records(v: &Value) -> Vec<RunRecord> {
 
 /// 离线导入结果。行号对应原始文件中记录数组的位置。
 pub struct LocalRecordImport {
+    /// 能参与统计的记录。
     pub records: Vec<RunRecord>,
+    /// 每条记录在原文件里的行号（1 基），与 `records` 一一对应。
     pub row_numbers: Vec<usize>,
+    /// 被跳过或降级的记录及原因，带原始行号。
     pub issues: Vec<String>,
 }
 
-fn checked_local_track(value: &Value) -> Result<Vec<(f64, f64)>, String> {
+fn checked_local_track(value: &Value) -> Result<Vec<(f64, f64)>, Error> {
     let decoded;
     let value = if let Some(raw) = value.as_str() {
-        decoded = serde_json::from_str::<Value>(raw).map_err(|_| "轨迹字符串不是合法 JSON")?;
+        decoded = serde_json::from_str::<Value>(raw)
+            .map_err(|_| ErrorKind::client("轨迹字符串不是合法 JSON".into()))?;
         &decoded
     } else {
         value
     };
-    let points = value.as_array().ok_or("轨迹应为坐标数组")?;
+    let points = value
+        .as_array()
+        .ok_or_else(|| ErrorKind::client("轨迹应为坐标数组".into()))?;
     points
         .iter()
         .enumerate()
@@ -196,14 +206,18 @@ fn checked_local_track(value: &Value) -> Result<Vec<(f64, f64)>, String> {
             {
                 Ok((lat, lon))
             }
-            _ => Err(format!("轨迹第 {} 点的经纬度无效", index + 1)),
+            _ => Err(ErrorKind::client(format!(
+                "轨迹第 {} 点的经纬度无效",
+                index + 1
+            ))),
         })
         .collect()
 }
 
 /// 检查导入的记录，记录无法参与统计的原始行号和原因。
-pub fn parse_local_records(value: &Value) -> Result<LocalRecordImport, &'static str> {
-    let rows = record_rows(value).ok_or("需要记录数组，或包含 records/list 数组的对象")?;
+pub fn parse_local_records(value: &Value) -> Result<LocalRecordImport, Error> {
+    let rows = record_rows(value)
+        .ok_or_else(|| ErrorKind::client("需要记录数组，或包含 records/list 数组的对象".into()))?;
     let mut result = LocalRecordImport {
         records: Vec::with_capacity(rows.len()),
         row_numbers: Vec::with_capacity(rows.len()),
@@ -228,7 +242,9 @@ pub fn parse_local_records(value: &Value) -> Result<LocalRecordImport, &'static 
             continue;
         };
         let duration_sec = match num(row, &["totalTime", "duration", "useTime"]) {
-            Some(duration) if (1.0..i64::MAX as f64).contains(&duration) => duration as i64,
+            Some(duration) if (1.0..i64::MAX as f64).contains(&duration) => {
+                crate::number::f64_to_i64(duration).unwrap_or(0)
+            }
             _ => {
                 issue("用时缺失或无效，此条不参加配速统计");
                 0
@@ -244,13 +260,13 @@ pub fn parse_local_records(value: &Value) -> Result<LocalRecordImport, &'static 
         {
             Some(Ok(track)) => track,
             Some(Err(detail)) => {
-                issue(&format!("{detail}，此条轨迹不参加统计"));
+                issue(&format!("{}，此条轨迹不参加统计", detail.message()));
                 Vec::new()
             }
             None => Vec::new(),
         };
         result.records.push(RunRecord {
-            start_ms: start_ms as i64,
+            start_ms: crate::number::f64_to_i64(start_ms).unwrap_or(0),
             distance_m,
             duration_sec,
             track,
@@ -298,7 +314,7 @@ pub fn start_hour_concentration(records: &[RunRecord], tz_offset_sec: i64) -> (u
     for r in records {
         let hour = (r.start_ms.div_euclid(1000) + tz_offset_sec)
             .div_euclid(3600)
-            .rem_euclid(24) as usize;
+            .rem_euclid(24) as usize; // 0..24 by construction
         bins[hour] += 1;
     }
     let (idx, &max) = bins
@@ -306,7 +322,10 @@ pub fn start_hour_concentration(records: &[RunRecord], tz_offset_sec: i64) -> (u
         .enumerate()
         .max_by_key(|&(_, c)| c)
         .unwrap_or((0, &0));
-    (idx as u32, max as f64 / records.len() as f64)
+    (
+        u32::try_from(idx).unwrap_or(u32::MAX),
+        max as f64 / records.len() as f64,
+    )
 }
 
 /// 离散度：`(均值, 变异系数)`。变异系数 = 标准差 / 均值。
@@ -393,7 +412,7 @@ pub fn max_pair_overlap(
 }
 
 #[cfg(test)]
-mod pace_fmt_tests {
+mod tests {
     use super::*;
 
     /// 59.6 秒要进位成 `1'00"`，不是 `0'60"`。
@@ -419,11 +438,27 @@ mod pace_fmt_tests {
         assert_eq!(near_midnight_count(&recs, 28_800), 2);
         assert_eq!(near_midnight_count(&recs[..1], 0), 0);
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    // ---- merged from former `mod tests` ----
+
+    /// 配置映射等价性：tz_offset 从配置层来，描述行带来源标注。
+    /// Guard 手工构造的 Config 不带来源 → 显示「默认」；注入来源分支在
+    /// pace-forge-config 的加载测试里覆盖。
+    #[test]
+    fn tz_offset_comes_from_config() {
+        assert_eq!(tz_offset_sec(), 8 * 3600, "默认东八区");
+        assert!(tz_description().contains("默认"), "{}", tz_description());
+        let _g = crate::config::Guard::replace(crate::config::Config {
+            network: crate::config::Network {
+                tz_offset_sec: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert_eq!(tz_offset_sec(), 0);
+        let d = tz_description();
+        assert!(d.starts_with("UTC+00:00"), "{d}");
+    }
 
     fn rec(day: i64, hour: i64, dist: f64, dur: i64) -> RunRecord {
         RunRecord {
@@ -580,7 +615,9 @@ mod tests {
         assert!(imported.issues[0].starts_with("第 2 条"));
         assert!(imported.issues[1].starts_with("第 3 条"));
         assert!(imported.issues[2].contains("第 4 条：用时"));
-        assert!(imported.issues[3].contains("第 4 条：轨迹第 2 点"));
+        assert!(
+            imported.issues[3].contains("第 4 条") && imported.issues[3].contains("轨迹第 2 点")
+        );
         assert!(imported.issues[4].starts_with("第 5 条"));
     }
 

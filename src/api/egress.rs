@@ -18,6 +18,7 @@
 //! 注意显示侧（web/index.html）拿到的 `ip` 字符串来自外部接口，渲染必须
 //! 走 `textContent`，不许拼 `innerHTML`。
 
+use crate::error::{Error, ErrorKind};
 use serde_json::{Value, json};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -50,7 +51,7 @@ fn load_config_once() -> Option<String> {
 }
 
 /// 保存出口配置。`None` / 空串表示清掉（回到直连）。
-pub fn save_proxy(spec: Option<&str>) -> Result<(), String> {
+pub fn save_proxy(spec: Option<&str>) -> Result<(), Error> {
     match spec.map(str::trim).filter(|s| !s.is_empty()) {
         Some(raw) => {
             let clean = parse_proxy(raw)?; // 先校验再落盘，坏值不写进去
@@ -63,7 +64,7 @@ pub fn save_proxy(spec: Option<&str>) -> Result<(), String> {
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(format!("清出口配置失败: {e}")),
+                Err(e) => return Err(ErrorKind::client(format!("清出口配置失败: {e}"))),
             }
             *runtime_slot().lock().unwrap_or_else(|p| p.into_inner()) = None;
         }
@@ -71,15 +72,17 @@ pub fn save_proxy(spec: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-/// 当前生效的出口：网页保存的优先，其次环境变量。
+/// 当前生效的出口：网页保存的优先，其次配置层（env > config.toml）。
 pub fn current_proxy() -> Option<String> {
     if let Some(p) = load_config_once() {
         return Some(p);
     }
-    std::env::var("PACE_EGRESS_PROXY")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    let p = crate::config::global()
+        .network
+        .egress_proxy
+        .trim()
+        .to_string();
+    (!p.is_empty()).then_some(p)
 }
 
 struct Probe {
@@ -94,36 +97,39 @@ const TTL: Duration = Duration::from_secs(300);
 ///
 /// 只认 `http://host:port`：ureq 2 的 `Proxy` 走 HTTP CONNECT，`socks5://`
 /// 需要额外 feature，这里先不给一个「写上了却不生效」的选项。
-pub fn parse_proxy(spec: &str) -> Result<String, String> {
+pub fn parse_proxy(spec: &str) -> Result<String, Error> {
     let spec = spec.trim();
-    let rest = spec
-        .strip_prefix("http://")
-        .ok_or_else(|| format!("只支持 http:// 前缀的 CONNECT 代理，收到：{spec}"))?;
+    let rest = spec.strip_prefix("http://").ok_or_else(|| {
+        ErrorKind::client(format!("只支持 http:// 前缀的 CONNECT 代理，收到：{spec}"))
+    })?;
     // 去掉 user:pass@
     let host_port = rest.rsplit('@').next().unwrap_or(rest);
-    let (host, port) = host_port
-        .rsplit_once(':')
-        .ok_or_else(|| format!("代理要带端口，例如 http://10.0.0.2:7890，收到：{host_port}"))?;
+    let (host, port) = host_port.rsplit_once(':').ok_or_else(|| {
+        ErrorKind::client(format!(
+            "代理要带端口，例如 http://10.0.0.2:7890，收到：{host_port}"
+        ))
+    })?;
     if host.is_empty() {
-        return Err("代理主机为空".into());
+        return Err(ErrorKind::client("代理主机为空".into()));
     }
     match port.parse::<u16>() {
         Ok(p) if p > 0 => Ok(format!("http://{host}:{p}")),
-        _ => Err(format!("代理端口不是 1..65535 的整数：{port}")),
+        _ => Err(ErrorKind::client(format!(
+            "代理端口不是 1..65535 的整数：{port}"
+        ))),
     }
 }
 
-/// 给 agent 追加信任根：`PACE_EXTRA_CA` 指向一个 PEM 文件时，把里面的证书
-/// 加到公共 CA 根之上（沙箱/企业出口网关自签 CA 的场景）。没设这个变量时
-/// 与原来逐字节等价，不动 TLS。
+/// 给 agent 追加信任根：配置 `network.extra_ca`（env `PACE_EXTRA_CA`）指向
+/// 一个 PEM 文件时，把里面的证书加到公共 CA 根之上（沙箱/企业出口网关自签
+/// CA 的场景）。没设时与原来逐字节等价，不动 TLS。
 pub fn with_extra_ca(builder: ureq::AgentBuilder) -> ureq::AgentBuilder {
-    let Some(path) = std::env::var("PACE_EXTRA_CA")
-        .ok()
-        .filter(|s| !s.is_empty())
-    else {
+    let cfg = crate::config::global();
+    let path = cfg.network.extra_ca.trim();
+    if path.is_empty() {
         return builder;
-    };
-    let pem = match std::fs::read(&path) {
+    }
+    let pem = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
             report_once(&format!("PACE_EXTRA_CA 读不到（{e}），本次按默认 CA 走"));
@@ -153,13 +159,15 @@ pub fn with_extra_ca(builder: ureq::AgentBuilder) -> ureq::AgentBuilder {
         .collect();
     roots.add_parsable_certificates(certs);
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let cfg = ureq::rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+    let versions = ureq::rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
         ureq::rustls::crypto::ring::default_provider(),
     ))
-    .with_safe_default_protocol_versions()
-    .expect("rustls 默认协议版本")
-    .with_root_certificates(roots)
-    .with_no_client_auth();
+    .with_safe_default_protocol_versions();
+    let Ok(versions) = versions else {
+        report_once("rustls 没给出默认协议版本，本次按默认 CA 走");
+        return builder;
+    };
+    let cfg = versions.with_root_certificates(roots).with_no_client_auth();
     builder.tls_config(std::sync::Arc::new(cfg))
 }
 

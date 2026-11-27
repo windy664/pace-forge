@@ -12,6 +12,7 @@
 //! 设计要点：
 //! `load_identity` / `save_session` / `clear_session` 三段式。
 
+use crate::error::{Error, ErrorKind};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -20,20 +21,28 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Session {
     #[serde(default)]
+    /// 用户 id。
     pub uid: String,
     #[serde(default)]
+    /// 登录 token。
     pub token: String,
     #[serde(default)]
+    /// 会话标识。
     pub unid: String,
     #[serde(default)]
+    /// 登录名。
     pub username: String,
     #[serde(default)]
+    /// 姓名。
     pub name: String,
     #[serde(default)]
+    /// 校区名。
     pub campus_name: String,
     #[serde(default)]
+    /// 院系。
     pub depart: String,
     #[serde(default)]
+    /// 班级。
     pub grade_class: String,
     /// 登录时使用的设备标识，登出时用于确认是同一台机
     #[serde(default)]
@@ -41,6 +50,7 @@ pub struct Session {
 }
 
 impl Session {
+    /// token 和 uid 都在才算已登录（不校验是否过期）。
     pub fn is_valid(&self) -> bool {
         !self.token.is_empty() && !self.uid.is_empty()
     }
@@ -81,14 +91,15 @@ pub fn data_dir_in(base: &Path) -> PathBuf {
     base.join(DATA_DIR_NAME)
 }
 
-/// 显式指定的数据目录（`PACE_FORGE_DATA_DIR`）。
+/// 显式指定的数据目录（配置 `server.data_dir` / env `PACE_FORGE_DATA_DIR`）。
 ///
 /// 设了就用它，**不再追加 `.pace-forge`**——用户给的是「数据放哪儿」，不是
 /// 「HOME 在哪儿」。多实例、把凭证放加密盘、CI 隔离都靠这个开关。
 pub fn data_dir_override() -> Option<PathBuf> {
-    std::env::var_os("PACE_FORGE_DATA_DIR")
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
+    // 原文直用（不 trim）：与旧 `var_os` 语义一致
+    let cfg = crate::config::global();
+    let dir = &cfg.server.data_dir;
+    (!dir.is_empty()).then(|| PathBuf::from(dir))
 }
 
 /// 数据目录：`<用户主目录>/.pace-forge/`。
@@ -114,8 +125,9 @@ pub fn data_dir() -> PathBuf {
 ///
 /// **建目录的责任点就在这里**。`data_dir()` / `data_dir_in()` 只算路径、不做
 /// IO，所以任何写盘路径都必须先走这里，否则首次运行时目录不存在、写失败。
-pub(crate) fn ensure_dir(dir: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("建目录 {} 失败: {e}", dir.display()))
+pub(crate) fn ensure_dir(dir: &Path) -> Result<(), Error> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| ErrorKind::client(format!("建目录 {} 失败: {e}", dir.display())))
 }
 
 /// 以 0600 权限写一个文件，**自动建父目录**。
@@ -127,7 +139,7 @@ pub(crate) fn ensure_dir(dir: &Path) -> Result<(), String> {
 /// 目录不存在时由这里负责建出来 —— `~/.pace-forge/` 在首次运行时并不存在，
 /// 早先 `data_dir()` 带 `create_dir_all` 副作用把它掩盖了；副作用去掉之后，
 /// 这个责任必须显式落在每个写盘路径上。
-pub(crate) fn write_file_private(path: &Path, data: &[u8]) -> Result<(), String> {
+pub(crate) fn write_file_private(path: &Path, data: &[u8]) -> Result<(), Error> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -155,21 +167,27 @@ pub(crate) fn write_file_private(path: &Path, data: &[u8]) -> Result<(), String>
             .truncate(true)
             .mode(0o600)
             .open(&tmp)
-            .map_err(|e| format!("写入 {} 失败: {e}", tmp.display()))?
+            .map_err(|e| ErrorKind::client(format!("写入 {} 失败: {e}", tmp.display())))?
     };
     #[cfg(not(unix))]
-    let mut f =
-        std::fs::File::create(&tmp).map_err(|e| format!("写入 {} 失败: {e}", tmp.display()))?;
+    let mut f = std::fs::File::create(&tmp)
+        .map_err(|e| ErrorKind::client(format!("写入 {} 失败: {e}", tmp.display())))?;
     use std::io::Write;
     let write_res = f.write_all(data).and_then(|_| f.sync_all());
     drop(f);
     if let Err(e) = write_res {
         let _ = std::fs::remove_file(&tmp);
-        return Err(format!("写入 {} 失败: {e}", tmp.display()));
+        return Err(ErrorKind::client(format!(
+            "写入 {} 失败: {e}",
+            tmp.display()
+        )));
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(format!("替换 {} 失败: {e}", path.display()));
+        return Err(ErrorKind::client(format!(
+            "替换 {} 失败: {e}",
+            path.display()
+        )));
     }
     Ok(())
 }
@@ -185,20 +203,25 @@ fn temp_sibling(path: &Path) -> std::path::PathBuf {
 fn read_json_below<T: serde::de::DeserializeOwned>(
     dir: &Path,
     name: &str,
-) -> Result<Option<T>, String> {
+) -> Result<Option<T>, Error> {
     let path = dir.join(name);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("读取 {} 失败: {error}", path.display())),
+        Err(error) => {
+            return Err(ErrorKind::client(format!(
+                "读取 {} 失败: {error}",
+                path.display()
+            )));
+        }
     };
     // 损坏的会话无法恢复。保留原文件，不因此阻止退出账号。
     Ok(serde_json::from_slice(&bytes).ok())
 }
 
-fn write_json_below<T: Serialize>(dir: &Path, name: &str, value: &T) -> Result<(), String> {
-    let json =
-        serde_json::to_string_pretty(value).map_err(|e| format!("序列化 {name} 失败: {e}"))?;
+fn write_json_below<T: Serialize>(dir: &Path, name: &str, value: &T) -> Result<(), Error> {
+    let json = serde_json::to_string_pretty(value)
+        .map_err(|e| ErrorKind::client(format!("序列化 {name} 失败: {e}")))?;
     // 会话文件含 token，write_file_private 会建目录并收紧到 0600
     write_file_private(&dir.join(name), json.as_bytes())
 }
@@ -217,12 +240,12 @@ pub(crate) fn load_session_below(dir: &Path) -> Session {
 }
 
 /// 写入会话（登录成功后立即调用）。
-pub fn save_session(s: &Session) -> Result<(), String> {
+pub fn save_session(s: &Session) -> Result<(), Error> {
     save_session_below(&data_dir(), s)
 }
 
 /// 同上，但数据目录由调用方指定。
-pub(crate) fn save_session_below(dir: &Path, s: &Session) -> Result<(), String> {
+pub(crate) fn save_session_below(dir: &Path, s: &Session) -> Result<(), Error> {
     write_json_below(dir, "session.json", s)
 }
 
@@ -243,7 +266,7 @@ pub(crate) fn clear_session_below(dir: &Path) {
 pub(crate) fn clear_session_if_below(
     dir: &Path,
     belongs_to_account: impl FnOnce(&Session) -> bool,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     if read_json_below::<Session>(dir, "session.json")?
         .as_ref()
         .is_some_and(belongs_to_account)
@@ -253,12 +276,15 @@ pub(crate) fn clear_session_if_below(
     Ok(())
 }
 
-fn remove_session_file(dir: &Path) -> Result<(), String> {
+fn remove_session_file(dir: &Path) -> Result<(), Error> {
     let path = dir.join("session.json");
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("删除会话文件 {} 失败: {error}", path.display())),
+        Err(error) => Err(ErrorKind::client(format!(
+            "删除会话文件 {} 失败: {error}",
+            path.display()
+        ))),
     }
 }
 

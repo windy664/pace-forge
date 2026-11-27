@@ -14,6 +14,7 @@
 //! 实现上取一次往返，用单程 RTT/2 补偿，所以偏差里含网络延迟的一半；
 //! 判据是「十几分钟级」的，这点误差无关。
 
+use crate::error::{Error, ErrorKind};
 use serde_json::Value;
 
 use super::client::Client;
@@ -26,19 +27,22 @@ pub const PATH: &str = "/api/v3/getserver/gmttime";
 /// `data` 可能是数字、数字字符串，也可能带秒级时间戳（某些网关版本），
 /// 三种都接受——校时失败不该让整条跑步链失败，但解析错了会整体错位十几分钟，
 /// 所以宁可在这里把形态放宽、把值校验严。
-pub fn parse(raw: &str) -> Result<i64, String> {
-    let v: Value = serde_json::from_str(raw).map_err(|e| format!("校时响应不是 JSON: {e}"))?;
+pub fn parse(raw: &str) -> Result<i64, Error> {
+    let v: Value = serde_json::from_str(raw)
+        .map_err(|e| ErrorKind::protocol(format!("校时响应不是 JSON: {e}")))?;
     let data = v
         .get("data")
         .or_else(|| v.get("serverTime"))
-        .ok_or("校时响应缺 data")?;
+        .ok_or_else(|| ErrorKind::protocol("校时响应缺 data".into()))?;
     let ms = match data {
-        Value::Number(n) => n.as_i64().ok_or("校时 data 不是整数")?,
+        Value::Number(n) => n
+            .as_i64()
+            .ok_or_else(|| ErrorKind::protocol("校时 data 不是整数".into()))?,
         Value::String(s) => s
             .trim()
             .parse::<i64>()
-            .map_err(|_| format!("校时 data 不是数字字符串: {s}"))?,
-        _ => return Err("校时 data 类型不支持".into()),
+            .map_err(|_| ErrorKind::protocol(format!("校时 data 不是数字字符串: {s}")))?,
+        _ => return Err(ErrorKind::protocol("校时 data 类型不支持".into())),
     };
     // 秒级 → 毫秒级
     let ms = if ms > 0 && ms < 1_000_000_000_000 {
@@ -48,7 +52,7 @@ pub fn parse(raw: &str) -> Result<i64, String> {
     };
     // 合理性：2001 年之后、2100 年之前
     if !(1_000_000_000_000..4_102_444_800_000).contains(&ms) {
-        return Err(format!("校时值不合法: {ms}"));
+        return Err(ErrorKind::protocol(format!("校时值不合法: {ms}")));
     }
     Ok(ms)
 }
@@ -56,14 +60,14 @@ pub fn parse(raw: &str) -> Result<i64, String> {
 /// 拉一次服务器时间，返回 `(server_ms, offset_ms)`。
 ///
 /// `offset_ms = 服务器时间（含单程补偿）− 本机时间`，直接加到本机时间上即可。
-pub fn fetch(client: &Client) -> Result<(i64, i64), String> {
-    let t0 = crate::crypto::envelope::now_ms() as i64;
+pub fn fetch(client: &Client) -> Result<(i64, i64), Error> {
+    let t0 = crate::crypto::envelope::now_ms();
     let raw = client.request(
         "GET",
         &format!("{}{}", crate::crypto::consts::hosts::RUN, PATH),
         None,
     )?;
-    let t1 = crate::crypto::envelope::now_ms() as i64;
+    let t1 = crate::crypto::envelope::now_ms();
     let server = parse(&raw)?;
     let rtt = (t1 - t0).max(0);
     let server_at_t1 = server + rtt / 2;
@@ -73,8 +77,8 @@ pub fn fetch(client: &Client) -> Result<(i64, i64), String> {
 /// 校准后的「现在」（毫秒）。失败时退回本机时钟，由调用方决定是否提示。
 pub fn server_now_ms(client: &Client) -> (i64, Option<i64>) {
     match fetch(client) {
-        Ok((_, off)) => (crate::crypto::envelope::now_ms() as i64 + off, Some(off)),
-        Err(_) => (crate::crypto::envelope::now_ms() as i64, None),
+        Ok((_, off)) => (crate::crypto::envelope::now_ms() + off, Some(off)),
+        Err(_) => (crate::crypto::envelope::now_ms(), None),
     }
 }
 

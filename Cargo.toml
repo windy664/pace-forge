@@ -1,3 +1,36 @@
+[workspace]
+members = ["crates/pace-forge-config"]
+
+# Lint baseline for the whole workspace (#58). Anything not listed here keeps
+# the default setting. `missing_docs` is on (every public item says what it is
+# for). The pedantic set is deliberately not enabled yet: CI runs clippy with
+# `-D warnings` and enabling it means cleaning up the rest in the same change.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unsafe_op_in_unsafe_fn = "deny"
+# Every public item says what it is for; this is what makes AI-written code reviewable.
+missing_docs = "deny"
+
+# Suppressions must stay observable: `expect` complains once its reason goes stale.
+[workspace.lints.clippy]
+allow_attributes = "deny"
+multiple_unsafe_ops_per_block = "deny"
+undocumented_unsafe_blocks = "deny"
+# Panicking in production code is a defect: the CLI has no catch_unwind net,
+# so an unwrap aborts the whole run with a raw panic (#61).
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+allow_attributes_without_reason = "deny"
+
+[lints]
+workspace = true
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = "1.1.4"
+
 [package]
 name = "pace-forge"
 version = "0.1.11"
@@ -21,9 +54,13 @@ gui = ["dep:eframe", "dep:egui"]
 name = "pace-forge"
 
 [dependencies]
+# --- 配置层 ---
+pace-forge-config = { path = "crates/pace-forge-config" }
+# --- 错误层 ---
+thiserror = "2"
 # --- 协议层 ---
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde.workspace = true
+serde_json.workspace = true
 tiny_http = "0.12"
 ureq = { version = "2", default-features = false, features = ["json", "tls", "gzip", "native-certs"] }
 # 加密

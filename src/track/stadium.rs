@@ -40,8 +40,10 @@ pub mod spec {
 /// 之后每道再加一个道宽。
 /// 标准田径场道次范围。
 pub const MIN_LANE: u8 = 1;
+/// 道次上界：标准田径场只有 8 道。
 pub const MAX_LANE: u8 = 8;
 
+/// 第 `lane` 道的弯道半径（米）；超出 1..=8 会夹回边界。
 pub fn lane_radius(lane: u8) -> f64 {
     // 标准跑道只有 1~8 道。之前用 lane.max(1) 兜底，第 9 道会被外推成
     // 一条不存在的跑道（单圈 461 m），第 0 道静默变成第 1 道。
@@ -70,6 +72,7 @@ pub struct StadiumSpec {
 }
 
 impl StadiumSpec {
+    /// 以场地中心建规格，默认第 1 道、东西向。
     pub fn new(lat: f64, lng: f64) -> Self {
         Self {
             center_lat: lat,
@@ -79,11 +82,13 @@ impl StadiumSpec {
         }
     }
 
+    /// 设道次（夹到 1..=8）。
     pub fn with_lane(mut self, lane: u8) -> Self {
         self.lane = lane.clamp(1, 8);
         self
     }
 
+    /// 设直道走向（弧度）。
     pub fn with_heading(mut self, rad: f64) -> Self {
         self.heading_rad = rad;
         self
@@ -153,9 +158,13 @@ pub fn point_at_dim(s: f64, straight: f64, radius: f64, heading: f64) -> (f64, f
 /// 一条校园操场的随机规格：尺寸/朝向/道次/圈数按真实记录区间随机。
 #[derive(Debug, Clone, Copy)]
 pub struct OvalSpec {
+    /// 直道长度（米）。
     pub straight: f64,
+    /// 弯道半径（米）。
     pub radius: f64,
+    /// 朝向（弧度）。
     pub heading: f64,
+    /// 圈数。
     pub laps: f64,
 }
 
@@ -281,6 +290,10 @@ pub fn stadium_track(spec_in: &StadiumSpec, laps: f64, sample_step_m: f64) -> Ve
 ///
 /// 判据：起终点几乎重合（差 <20m）且总长是圈长整数倍附近，
 /// 同时轨迹的曲率分布有明显「直道 0 / 弯道高」的二态特征。
+#[expect(
+    clippy::unwrap_used,
+    reason = "non-empty is guaranteed by the guard above"
+)]
 pub fn looks_like_stadium(points: &[(f64, f64)], tol_m: f64) -> bool {
     if points.len() < 16 {
         return false;

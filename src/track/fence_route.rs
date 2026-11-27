@@ -8,6 +8,7 @@
 //! 扫描铺满，实际长度对不上目标就调扫描间距重来。
 
 use super::geo::{distance, m_per_deg_lat, m_per_deg_lng};
+use crate::error::{Error, ErrorKind};
 
 /// 离围栏边界至少留这么多米。贴边容易被判越界。
 pub const EDGE_MARGIN_M: f64 = 20.0;
@@ -300,6 +301,10 @@ fn detour_around(
 /// 整条折线避让障碍：逐点推出 + 逐段绕行。
 ///
 /// 返回新点列。避不开的部分保持原样（宁可穿一次也不要整条轨迹断掉）。
+#[expect(
+    clippy::unwrap_used,
+    reason = "non-empty is guaranteed by the guard above"
+)]
 pub fn avoid_blockers(
     points: &[(f64, f64)],
     blockers: &[Vec<(f64, f64)>],
@@ -417,14 +422,8 @@ pub fn nudge_outside(
     moved
 }
 
-/// 蛇形扫描填充多边形，返回折线点。
-///
 /// `spacing_m` 是相邻扫描线的间距（米）。越小线越密、总长越长。
-#[allow(dead_code)] // route_along_fence 已接管，保留作算法参考
-fn boustrophedon(poly: &[(f64, f64)], spacing_m: f64) -> (Vec<(f64, f64)>, usize) {
-    boustrophedon_avoiding(poly, spacing_m, &[])
-}
-
+// route_along_fence 已接管，保留作算法参考；现在只有测试在用。
 /// 带障碍的蛇形扫描。障碍（湖、河、楼）内部不铺线。
 fn boustrophedon_avoiding(
     poly: &[(f64, f64)],
@@ -496,7 +495,7 @@ pub fn path_len(pts: &[(f64, f64)]) -> f64 {
 /// 不靠调扫描间距——间距只能取「几条线」，总长是跳变的（800m 的目标只能拿到
 /// 850m 或 1284m，中间没有解）。改成先铺一条足够密的蛇形路径，再沿路径走到
 /// 目标长度为止。这样长度是连续可控的。
-pub fn route_in_fence(fence: &[(f64, f64)], want_m: f64) -> Result<FenceRoute, String> {
+pub fn route_in_fence(fence: &[(f64, f64)], want_m: f64) -> Result<FenceRoute, Error> {
     route_in_fence_with(fence, want_m, &[])
 }
 
@@ -512,7 +511,7 @@ pub fn route_in_fence_with(
     fence: &[(f64, f64)],
     want_m: f64,
     must: &[(f64, f64)],
-) -> Result<FenceRoute, String> {
+) -> Result<FenceRoute, Error> {
     route_in_fence_avoiding(fence, want_m, must, &[])
 }
 
@@ -522,12 +521,12 @@ pub fn route_in_fence_avoiding(
     want_m: f64,
     must: &[(f64, f64)],
     blockers: &[Vec<(f64, f64)>],
-) -> Result<FenceRoute, String> {
+) -> Result<FenceRoute, Error> {
     if fence.len() < 3 {
-        return Err("围栏点数不足，无法规划".into());
+        return Err(ErrorKind::fence("围栏点数不足，无法规划".into()));
     }
     if want_m <= 0.0 {
-        return Err("目标里程必须为正".into());
+        return Err(ErrorKind::fence("目标里程必须为正".into()));
     }
 
     // 只保留真正落在围栏内的必经点
@@ -568,7 +567,9 @@ pub fn route_in_fence_avoiding(
     let lat_max = inner.iter().map(|p| p.0).fold(f64::MIN, f64::max);
     let heat_m = (lat_max - lat_min) * m_per_deg_lat((lat_min + lat_max) / 2.0);
     if heat_m < 10.0 {
-        return Err(format!("围栏太窄（南北 {heat_m:.0}m），放不下轨迹"));
+        return Err(ErrorKind::fence(format!(
+            "围栏太窄（南北 {heat_m:.0}m），放不下轨迹"
+        )));
     }
 
     let mlat = m_per_deg_lat((lat_min + lat_max) / 2.0).max(1.0);
@@ -579,15 +580,15 @@ pub fn route_in_fence_avoiding(
     let spacing = 15.0f64.max(heat_m / 400.0);
     let (dense, lines) = boustrophedon_avoiding(&inner, spacing, blockers);
     if dense.len() < 2 {
-        return Err("围栏内没能生成扫描线".into());
+        return Err(ErrorKind::fence("围栏内没能生成扫描线".into()));
     }
     let dense_len = path_len(&dense);
     if dense_len < want_m {
-        return Err(format!(
+        return Err(ErrorKind::fence(format!(
             "围栏面积不够：内缩后约 {:.0} m²，铺满只有 {:.0} m 轨迹（目标 {:.0} m）\n\
              换个更小的目标里程，或者确认围栏是否正确",
             area_m2, dense_len, want_m
-        ));
+        )));
     }
 
     // 沿密路径走 `walk` 米，返回折线和实际长度
@@ -645,7 +646,7 @@ pub fn route_in_fence_avoiding(
         target = (target - (total - want_m)).clamp(want_m * 0.3, want_m * 1.15);
     }
 
-    let (points, _length_m) = best.ok_or("围栏内规划失败")?;
+    let (points, _length_m) = best.ok_or_else(|| ErrorKind::fence("围栏内规划失败".into()))?;
 
     // 把必经点钉进折线，保证轨迹真的穿过打卡点。
     //
@@ -729,6 +730,10 @@ pub fn round_corners(path: &[(f64, f64)], radius_m: f64, seg_per_corner: usize) 
             ));
         }
     }
+    #[expect(
+        clippy::unwrap_used,
+        reason = "non-empty is guaranteed by the guard above"
+    )]
     out.push(*path.last().unwrap());
     out
 }
@@ -812,17 +817,19 @@ pub fn route_along_fence(
     want_m: f64,
     inset_m: f64,
     must: &[(f64, f64)],
-) -> Result<FenceRoute, String> {
+) -> Result<FenceRoute, Error> {
     if fence.len() < 3 {
-        return Err("围栏点数不足".into());
+        return Err(ErrorKind::fence("围栏点数不足".into()));
     }
     if want_m <= 0.0 {
-        return Err("目标里程必须为正".into());
+        return Err(ErrorKind::fence("目标里程必须为正".into()));
     }
     let ring = shrink(fence, inset_m);
     let one_lap = path_len(&ring);
     if one_lap < 20.0 {
-        return Err(format!("内缩后周长只有 {one_lap:.0}m，太短"));
+        return Err(ErrorKind::fence(format!(
+            "内缩后周长只有 {one_lap:.0}m，太短"
+        )));
     }
 
     // 圈数：想跑够里程，但不要超过 3 圈（再多就明显是机器绕圈了）
@@ -886,17 +893,21 @@ pub fn route_along_fence(
 ///
 /// 走法：每两个点之间走一条绕行弧（不是直线），弧朝围栏内侧鼓出，这样
 /// 既按顺序经过，又不会横穿整个校区。里程不够就在最后两个点之间多绕。
+#[expect(
+    clippy::unwrap_used,
+    reason = "non-empty is guaranteed by the guard above"
+)]
 pub fn route_through_in_order(
     fence: &[(f64, f64)],
     want_m: f64,
     must: &[(f64, f64)],
     seed: u64,
-) -> Result<FenceRoute, String> {
+) -> Result<FenceRoute, Error> {
     if must.len() < 2 {
-        return Err("至少两个必经点".into());
+        return Err(ErrorKind::fence("至少两个必经点".into()));
     }
     if want_m <= 0.0 {
-        return Err("目标里程必须为正".into());
+        return Err(ErrorKind::fence("目标里程必须为正".into()));
     }
     // 硬防护：必经点必须落在这个围栏附近。
     //
@@ -906,16 +917,18 @@ pub fn route_through_in_order(
         if !contains(fence, m.0, m.1) {
             let d = crate::track::geo::distance(*m, fence[0]);
             if d > 5000.0 {
-                return Err(format!(
+                return Err(ErrorKind::fence(format!(
                     "必经点 ({:.5},{:.5}) 距围栏起点 {d:.0}m，不在同一个校区，拒绝规划",
                     m.0, m.1
-                ));
+                )));
             }
         }
     }
     // 目标里程上限：42 公里是项目硬上限
     if want_m > 42_000.0 {
-        return Err(format!("目标里程 {want_m:.0}m 超过 42000m 上限"));
+        return Err(ErrorKind::fence(format!(
+            "目标里程 {want_m:.0}m 超过 42000m 上限"
+        )));
     }
 
     let mut rng = seed | 1;
@@ -945,12 +958,8 @@ pub fn route_through_in_order(
         //
         // 压到段长的 18%、上限 60m：弧只做轻微避让，主体贴近两点连线，
         // 看起来像绕开一个花坛而不是从教学楼中间穿过去。
-        // 想更直就设 PACE_BULGE_MAX=0。
-        let bulge_max = std::env::var("PACE_BULGE_MAX")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| (0.0..=300.0).contains(v))
-            .unwrap_or(60.0);
+        // 想更直就设 PACE_BULGE_MAX=0（配置 run.bulge_max）；范围在加载时校验。
+        let bulge_max = crate::config::global().run.bulge_max;
         let bulge = (d * 0.18).clamp(8.0, bulge_max.max(8.0));
         // 鼓向：朝围栏中心那一侧，别跑到围栏外面
         let cx = fence.iter().map(|p| p.0).sum::<f64>() / fence.len() as f64;
@@ -1058,6 +1067,10 @@ pub fn route_through_in_order(
     let stop_at = (want_m - super::geo::length_tolerance(want_m)).max(want_m * 0.7);
     while total < stop_at && guard < 200 && total < hard_cap {
         guard += 1;
+        #[expect(
+            clippy::unwrap_used,
+            reason = "non-empty is guaranteed by the guard above"
+        )]
         let anchor = *points.last().unwrap();
         // 绕圈半径 40~90m，圈心朝围栏中心
         let cx = fence.iter().map(|p| p.0).sum::<f64>() / fence.len() as f64;
@@ -1411,7 +1424,7 @@ mod tests {
         assert!(
             back > 0,
             "打卡点回钉必然把轨迹拖回禁区；哪天这里变成 0，说明 pin_checkpoints \\
-             开始考虑禁区了，flow 里那条警告可以改回「已绕行」"
+         开始考虑禁区了，flow 里那条警告可以改回「已绕行」"
         );
         // 而且被拖回去的必须包含打卡点本身
         assert!(
@@ -1694,11 +1707,8 @@ mod tests {
         let hit = pts.iter().any(|p| distance(*p, cp) < 0.1);
         assert!(hit, "打卡点应该被吸附到路径上");
     }
-}
 
-#[cfg(test)]
-mod order_debug_tests {
-    use super::*;
+    // ---- merged from former `mod order_debug_tests` ----
 
     /// 真实校区尺度下，按序串点不该产出公里级以外的长度。
     #[test]
@@ -1855,5 +1865,10 @@ mod order_debug_tests {
         assert!(r.is_some(), "detour_around 返回 None，绕行没生成");
         assert!(out.len() > 2, "avoid_blockers 没插点");
         assert_eq!(inside, 0, "仍有 {inside} 个点落在矩形内");
+    }
+
+    /// 蛇形扫描填充多边形，返回折线点（无障碍版本的薄封装）。
+    fn boustrophedon(poly: &[(f64, f64)], spacing_m: f64) -> (Vec<(f64, f64)>, usize) {
+        boustrophedon_avoiding(poly, spacing_m, &[])
     }
 }

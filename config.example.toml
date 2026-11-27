@@ -1,0 +1,111 @@
+# pace-forge 配置文件示例（可选——不放这个文件就全走默认值 + 环境变量）。
+#
+# 搜索顺序：--config <路径> > PACE_CONFIG > ./config.toml > ~/.pace-forge/config.toml
+# 优先级：  环境变量 PACE_* > 本文件 > 内置默认值
+#
+# 当前哪些开关非默认、来自哪一层（env / config.toml），Web 启动日志会打一行汇总。
+# 本文件里出现的键必须是下面这些——未知键会在启动时报错，这是特性（防拼写错误）。
+# 注意 PACE_OUT、PACE_FAST 这类是 preflight 检查码，不是配置，别写进来。
+# 拿去用的时候记得改名成 config.toml。
+
+[server]
+# Web 控制台口令。不设只接受本机访问；设了才允许同网段访问（请求带 X-Pace-Token）。
+# env: PACE_FORGE_TOKEN
+#token = ""
+
+# 数据目录（账号库、session、缓存）。设了就不再追加 .pace-forge；不影响本文件的搜索。
+# env: PACE_FORGE_DATA_DIR
+#data_dir = ""
+
+[network]
+# 提交链路出口 http://host:port。优先级：网页里保存的 > 环境变量 > 这里的值。
+# env: PACE_EGRESS_PROXY
+#egress_proxy = "http://127.0.0.1:7890"
+
+# 追加信任根：PEM 文件路径（沙箱/企业网关自签 CA 场景）。文件读不到按默认 CA 走并提示。
+# env: PACE_EXTRA_CA
+#extra_ca = ""
+
+# OBS 时间戳的时区偏移（秒），默认东八区；±20 小时以内，跨时区部署才需要改。
+# env: PACE_TZ_OFFSET_SEC
+#tz_offset_sec = 28800
+
+[device]
+# 上报的 appVersion，默认真机版本 7.4.20（code 411）。改它等于自报别的客户端版本。
+# env: PACE_APP_VERSION
+#app_version = "7.4.20"
+
+# 机型 code 或平台代号：命中 data/devices.json 时 cpuModel 发 SoC 型号（SM8550），
+# 未收录仍发 ABI（arm64-v8a）并提示一次。
+# env: PACE_DEVICE_MODEL
+#model = ""
+
+# 五个硬件头（androidId/blMac/wifiMac/IMEI/CustomDeviceId）：derived 发派生假值，
+# 默认 empty 发空串（7.4.21 硬编码口径）。DeviceId 不受影响。
+# env: PACE_DEVICE_HW_HEADERS
+#hw_headers = "empty"
+
+[run]
+# CLI 刷跑的 runMode：1=计分跑，2=户外跑；任意整数都收（0/2~6 服务端都当自由跑）。
+# env: PACE_RUN_MODE
+#run_mode = 2
+
+# 几何采样间距（米，正数），只管形状不管上报节奏。
+# env: PACE_STEP_M
+#step_m = 5.0
+
+# 几何规划时弧的鼓出上限（米，0~300）。设 0 更贴直线。
+# env: PACE_BULGE_MAX
+#bulge_max = 60
+
+# 步频回归系数（cadence = 截距 + 斜率×v），不设就用内置的 34.4 / 44.5。
+# 这对常数是从**别人**的 4 条记录拟合来的，服务端看的是账号画像——
+# 同一个公式在不同账号身上「像不像本人」不一样，必要时按自己账号的历史标定。
+# ⚠️ 用之前先量自己账号的步幅分布，别照抄别人的常数：实测有账号把截距
+# 改成 45.3 之后步幅反而掉出历史区间（0.822~0.880 m），比默认更差。
+# env: PACE_CAD_INTERCEPT / PACE_CAD_SLOPE
+#cad_intercept = 34.4
+#cad_slope = 44.5
+
+# 点位 type 口径：auto（按有无必到点分流）/ old / new（对照实验用）。
+# env: PACE_PT_SCHEME
+#pt_scheme = "auto"
+
+# 固定点口径：auto / all0 / allnormal（全发 0）/ server / follow。
+# 旧变量 PACE_FORCE_NORMAL_POINT 仍认（0→server，1→all0），仅在本键未设时生效。
+# env: PACE_FIXED_POINT
+#fixed_point = "auto"
+
+# 必到点只认 10 米内，够不着就报缺失，不自动放开半径。
+# env: PACE_FIXED_STRICT
+#fixed_strict = false
+
+# 策略拉取失败直接报错，不走 runMode=2 兜底。
+# env: PACE_STRICT_POLICY
+#strict_policy = false
+
+# 围栏对象发完整结构（distance/id/name），默认只发 points。
+# env: PACE_FENCE_FULL
+#fence_full = false
+
+# 提交报文发 runAreaId=-1，退回旧行为做对照实验（默认发真实围栏 id）。
+# env: PACE_RUN_AREA_ID
+#run_area_id = "-1"
+
+# 围栏锚点（纬度/经度），自由跑换城市或学校没配围栏时用。
+# 两个必须成对出现，缺一半启动时报错。
+# env: PACE_CENTER_LAT / PACE_CENTER_LNG
+#center_lat = 30.0
+#center_lng = 104.0
+
+# CLI 默认试操场轨迹（web 不读这个，走自己的跑法选择）。
+# env: PACE_PREFER_STADIUM
+#prefer_stadium = false
+
+# 超日上限也继续提交。注意：旧版「设了就算（连 =0 都生效）」已改为标准布尔，0 就是关。
+# env: PACE_IGNORE_DAILY_LIMIT
+#ignore_daily_limit = false
+
+# 策略响应落盘目录（排障用）。策略响应里有考生身份字段，默认不落盘。
+# env: PACE_DUMP_POLICY
+#dump_policy = ""

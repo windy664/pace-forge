@@ -70,8 +70,53 @@ fn checked_km_min(dist_km: f64, dur_min: f64) -> (f64, f64) {
     (dist_km, dur_min)
 }
 
+/// 从参数里摘出 `--config <路径>`（找到就从 args 里移除，避免落进子命令的
+/// 位置参数）。写了 `--config` 没跟路径直接报错。
+fn take_config_path(args: &mut Vec<String>) -> Option<String> {
+    let i = args.iter().position(|a| a == "--config")?;
+    let p = match args.get(i + 1) {
+        Some(p) if !p.starts_with("--") => p.clone(),
+        _ => {
+            eprintln!("参数错误：--config 后面要跟一个配置文件路径");
+            std::process::exit(2);
+        }
+    };
+    args.drain(i..=i + 1);
+    Some(p)
+}
+
+/// Not logged in / credentials missing. Same value as `ErrorKind::Auth` below.
+const EXIT_AUTH: i32 = 4;
+
+/// Exit code for a failed command, by error category. `0` is success and `2` is a
+/// usage error (handled at the argument parsers); `cheat` documents its own
+/// `0/2/3`, so these start at 4. Scripts should branch on these instead of on text.
+fn exit_code_for(e: &pace_forge::error::Error) -> i32 {
+    use pace_forge::error::ErrorKind;
+    match e {
+        ErrorKind::Auth(_) => EXIT_AUTH,
+        ErrorKind::RateLimit(_) => 5,
+        ErrorKind::Network(_) => 6,
+        ErrorKind::Protocol { .. } => 7,
+        ErrorKind::Fence(_) => 8,
+        _ => 1,
+    }
+}
+
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let config_path = take_config_path(&mut args);
+    // 配置只在这一处加载：TOML（--config / PACE_CONFIG / ./config.toml /
+    // ~/.pace-forge/config.toml）+ PACE_* 环境变量覆盖，非法值在这里直接
+    // 报错退出，不再静默回落。
+    let cfg = match pace_forge::config::load(config_path.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("配置加载失败：\n  - {e}");
+            std::process::exit(2);
+        }
+    };
+    pace_forge::config::store(cfg);
     let cmd = args.first().map(|s| s.as_str()).unwrap_or("web");
 
     match cmd {
@@ -85,7 +130,7 @@ fn main() {
             }
             if let Err(e) = pace_forge::web::serve(&addr) {
                 eprintln!("启动失败: {e}");
-                std::process::exit(1);
+                std::process::exit(exit_code_for(&e));
             }
         }
         "semester" => show_semester(),
@@ -156,7 +201,7 @@ fn main() {
                 Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default()),
                 Err(e) => {
                     eprintln!("回读失败: {e}");
-                    std::process::exit(1);
+                    std::process::exit(exit_code_for(&e));
                 }
             }
         }
@@ -198,7 +243,6 @@ fn main() {
             let lane = parse_int(&args, 2, 1, "道次") as u8;
             stadium_probe(laps, lane);
         }
-        "config" => pace_forge::config::print_table(),
         "devices" => print!("{}", pace_forge::api::device_table::report()),
         "crosscheck" => do_crosscheck(args.get(1).map(|s| s.as_str())),
         "audit" => do_audit(false, args.get(1).map(|s| s.as_str())),
@@ -239,7 +283,6 @@ fn main() {
             println!("  pace-forge ago <分钟> [km] [min]            补跑：N 分钟前");
             println!("  pace-forge rand [km] [min] [--days N]       补跑：当天 7-20 点随机时刻");
             println!("  pace-forge stadium [圈] [道次] 操场轨迹参数");
-            println!("  pace-forge config              列出全部 PACE_* 开关与当前取值");
             println!("  pace-forge devices             机型/SoC 表：内容、当前 cpuModel、怎么补表");
             println!(
                 "  pace-forge crosscheck <json>   跨记录自检：连续天数、起跑时刻、离散度、轨迹重合"
@@ -261,6 +304,9 @@ fn main() {
             println!();
             println!("规则：开始 + 用时 + 5s 余量 ≤ 现在，最多往前补 3 天。");
             println!(
+                "配置：--config <路径> 指定配置文件，默认搜索 ./config.toml 和 ~/.pace-forge/config.toml；\n环境变量 PACE_* 覆盖配置文件，全部键见 config.example.toml。"
+            );
+            println!(
                 "run/dry/at/ago/rand 需要已保存的登录会话（$HOME/.pace-forge/session.json）。"
             );
         }
@@ -277,7 +323,7 @@ fn dry_run(dist_km: f64, dur_min: f64) {
     let sess = session::load_session();
     if !sess.is_valid() {
         eprintln!("未登录：先通过 Web 控制台登录一次（会话存在 $HOME/.pace-forge/session.json）");
-        std::process::exit(1);
+        std::process::exit(EXIT_AUTH);
     }
     let client =
         pace_forge::api::client::Client::new(pace_forge::api::client::DeviceProfile::default())
@@ -298,7 +344,7 @@ fn dry_run(dist_km: f64, dur_min: f64) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("拿不到围栏中心点，无法规划轨迹: {e}");
-            std::process::exit(1);
+            std::process::exit(exit_code_for(&e));
         }
     };
     println!("围栏中心: ({clat:.5}, {clng:.5})");
@@ -308,7 +354,7 @@ fn dry_run(dist_km: f64, dur_min: f64) {
         center_lng: clng,
         distance_m: dist_km * 1000.0,
         duration_sec: (dur_min * 60.0).round() as i64,
-        prefer_stadium: flow::prefer_stadium_env(),
+        prefer_stadium: pace_forge::config::global().run.prefer_stadium,
         ..Default::default()
     };
 
@@ -336,7 +382,7 @@ fn dry_run(dist_km: f64, dur_min: f64) {
         }
         Err(e) => {
             eprintln!("\n预演失败: {e}");
-            std::process::exit(1);
+            std::process::exit(exit_code_for(&e));
         }
     }
 }
@@ -490,7 +536,7 @@ fn do_login(username: &str, password: &str) {
             };
             if let Err(e) = session::save_session(&sess) {
                 eprintln!("session 写入失败: {e}");
-                std::process::exit(1);
+                std::process::exit(exit_code_for(&e));
             }
             println!(
                 "✅ 登录成功：{}（{} / {}）",
@@ -503,7 +549,7 @@ fn do_login(username: &str, password: &str) {
         }
         Err(e) => {
             eprintln!("登录失败: {e}");
-            std::process::exit(1);
+            std::process::exit(exit_code_for(&e));
         }
     }
 }
@@ -527,7 +573,7 @@ fn do_relogin() {
         Ok(p) => p,
         Err(e) => {
             eprintln!("密码解密失败: {e}");
-            std::process::exit(1);
+            std::process::exit(exit_code_for(&e));
         }
     };
 
@@ -563,7 +609,7 @@ fn do_relogin() {
         }
         Err(e) => {
             eprintln!("登录失败: {e}");
-            std::process::exit(1);
+            std::process::exit(exit_code_for(&e));
         }
     }
 }
@@ -609,7 +655,7 @@ fn do_logout() {
         Ok(false) => println!("服务端没有返回明确的注销结果，可能是 token 已失效"),
         Err(e) => {
             eprintln!("注销请求失败: {e}");
-            std::process::exit(1);
+            std::process::exit(exit_code_for(&e));
         }
     }
 
@@ -672,7 +718,7 @@ fn do_review(n: u32) {
     let sess = session::load_session();
     if !sess.is_valid() {
         eprintln!("未登录：先执行 `pace-forge web` 在网页里登录一次");
-        std::process::exit(1);
+        std::process::exit(EXIT_AUTH);
     }
     let c = client::Client::new(client::DeviceProfile::default()).with_credentials(
         client::Credentials {
@@ -685,7 +731,7 @@ fn do_review(n: u32) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("拉取记录失败: {e}");
-            std::process::exit(1);
+            std::process::exit(exit_code_for(&e));
         }
     };
     let rows = list
@@ -1010,7 +1056,7 @@ fn do_export_records(rest: &[String]) {
     let sess = session::load_session();
     if !sess.is_valid() {
         eprintln!("未登录：先执行 `pace-forge web` 在网页里登录一次");
-        std::process::exit(1);
+        std::process::exit(EXIT_AUTH);
     }
     let c = client::Client::new(client::DeviceProfile::default()).with_credentials(
         client::Credentials {
@@ -1024,7 +1070,7 @@ fn do_export_records(rest: &[String]) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("拉记录列表失败: {e}");
-            std::process::exit(1);
+            std::process::exit(exit_code_for(&e));
         }
     };
     let rows = list
@@ -1147,7 +1193,7 @@ fn do_cheat() {
     let sess = pace_forge::api::session::load_session();
     if !sess.is_valid() {
         eprintln!("未登录：先执行 `pace-forge web` 在网页里登录一次");
-        std::process::exit(1);
+        std::process::exit(EXIT_AUTH);
     }
     let client =
         pace_forge::api::client::Client::new(pace_forge::api::client::DeviceProfile::default())
@@ -1172,7 +1218,7 @@ fn do_cheat() {
         }
         Err(e) => {
             eprintln!("查询失败: {e}");
-            std::process::exit(1);
+            std::process::exit(exit_code_for(&e));
         }
     }
 }
@@ -1183,7 +1229,7 @@ fn show_semester() {
     let sess = session::load_session();
     if !sess.is_valid() {
         eprintln!("未登录：先执行 `pace-forge web` 在网页里登录一次");
-        std::process::exit(1);
+        std::process::exit(EXIT_AUTH);
     }
     let client =
         pace_forge::api::client::Client::new(pace_forge::api::client::DeviceProfile::default())
@@ -1217,7 +1263,10 @@ fn show_semester() {
                 }
             }
         }
-        Err(e) => eprintln!("查学期汇总失败: {e}"),
+        Err(e) => {
+            eprintln!("查学期汇总失败: {e}");
+            std::process::exit(exit_code_for(&e));
+        }
     }
 
     match goal {
@@ -1270,7 +1319,7 @@ fn run_with_start(
     let sess = session::load_session();
     if !sess.is_valid() {
         eprintln!("未登录：先执行 `pace-forge web` 在网页里登录一次");
-        std::process::exit(1);
+        std::process::exit(EXIT_AUTH);
     }
     let client =
         pace_forge::api::client::Client::new(pace_forge::api::client::DeviceProfile::default())
@@ -1297,6 +1346,7 @@ fn run_with_start(
         }
     };
 
+    let cfg = pace_forge::config::global();
     let p = flow::RunParams {
         center_lat: clat,
         center_lng: clng,
@@ -1311,16 +1361,10 @@ fn run_with_start(
         run_mode: if free_sport.is_some() {
             2
         } else {
-            std::env::var("PACE_RUN_MODE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2)
+            cfg.run.run_mode
         },
-        sample_step_m: std::env::var("PACE_STEP_M")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(5.0),
-        prefer_stadium: flow::prefer_stadium_env(),
+        sample_step_m: cfg.run.step_m,
+        prefer_stadium: cfg.run.prefer_stadium,
         ..Default::default()
     };
 
@@ -1373,7 +1417,7 @@ fn run_with_start(
         }
         Err(e) => {
             eprintln!("\n失败: {e}");
-            std::process::exit(1);
+            std::process::exit(exit_code_for(&e));
         }
     }
 }
@@ -1437,16 +1481,16 @@ fn do_at(hhmm: &str, days: i64, dist_km: f64, dur_min: f64, yes: bool) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{e}");
-            std::process::exit(1);
+            std::process::exit(exit_code_for(&e));
         }
     };
-    let now = pace_forge::crypto::envelope::now_ms() as i64;
+    let now = pace_forge::crypto::envelope::now_ms();
     let dur_s = (dur_min * 60.0).round() as i64;
     let st = match st_mod::specified(now, days, h, m, dur_s) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{e}");
-            std::process::exit(1);
+            std::process::exit(exit_code_for(&e));
         }
     };
     show_plan(st, dur_min);
@@ -1455,13 +1499,13 @@ fn do_at(hhmm: &str, days: i64, dist_km: f64, dur_min: f64, yes: bool) {
 
 fn do_ago(mins: i64, dist_km: f64, dur_min: f64, yes: bool) {
     use pace_forge::api::start_time as st_mod;
-    let now = pace_forge::crypto::envelope::now_ms() as i64;
+    let now = pace_forge::crypto::envelope::now_ms();
     let dur_s = (dur_min * 60.0).round() as i64;
     let st = match st_mod::ago(now, mins, dur_s) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{e}");
-            std::process::exit(1);
+            std::process::exit(exit_code_for(&e));
         }
     };
     show_plan(st, dur_min);
@@ -1471,14 +1515,14 @@ fn do_ago(mins: i64, dist_km: f64, dur_min: f64, yes: bool) {
 fn do_rand(days: i64, dist_km: f64, dur_min: f64, yes: bool) {
     use pace_forge::api::start_time as st_mod;
     use rand::Rng;
-    let now = pace_forge::crypto::envelope::now_ms() as i64;
+    let now = pace_forge::crypto::envelope::now_ms();
     let dur_s = (dur_min * 60.0).round() as i64;
     let r: f64 = rand::rng().random();
     let st = match st_mod::random_in_day(now, days, dur_s, r) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{e}");
-            std::process::exit(1);
+            std::process::exit(exit_code_for(&e));
         }
     };
     show_plan(st, dur_min);
@@ -1494,7 +1538,7 @@ fn ai_client() -> pace_forge::api::client::Client {
     let sess = pace_forge::api::session::load_session();
     if !sess.is_valid() {
         eprintln!("未登录：先执行 `pace-forge web` 在网页里登录一次");
-        std::process::exit(1);
+        std::process::exit(EXIT_AUTH);
     }
     pace_forge::api::client::Client::new(pace_forge::api::client::DeviceProfile::default())
         .with_credentials(pace_forge::api::client::Credentials {
@@ -1516,7 +1560,7 @@ fn do_ai_list() {
         }
         Err(e) => {
             eprintln!("拉项目列表失败: {e}");
-            std::process::exit(1);
+            std::process::exit(exit_code_for(&e));
         }
     }
 }
@@ -1556,7 +1600,7 @@ fn do_ai(sport: i64, score: i64, minutes: bool, days: Option<i64>, yes: bool) {
         Some(d) => {
             use pace_forge::api::start_time as st_mod;
             use rand::Rng;
-            let now = pace_forge::crypto::envelope::now_ms() as i64;
+            let now = pace_forge::crypto::envelope::now_ms();
             let dur_s = if minutes {
                 score * 60
             } else {
@@ -1568,7 +1612,7 @@ fn do_ai(sport: i64, score: i64, minutes: bool, days: Option<i64>, yes: bool) {
                 Ok(st) => Some(st.ms),
                 Err(e) => {
                     eprintln!("{e}");
-                    std::process::exit(1);
+                    std::process::exit(exit_code_for(&e));
                 }
             }
         }
@@ -1597,7 +1641,7 @@ fn do_ai(sport: i64, score: i64, minutes: bool, days: Option<i64>, yes: bool) {
         Ok(v) => println!("✅ 提交成功：{}", v.get("data").unwrap_or(&v)),
         Err(e) => {
             eprintln!("提交失败: {e}");
-            std::process::exit(1);
+            std::process::exit(exit_code_for(&e));
         }
     }
 }
@@ -1648,12 +1692,17 @@ fn do_ai_records(sport: i64, n: i64) {
         }
         Err(e) => {
             eprintln!("拉记录失败: {e}");
-            std::process::exit(1);
+            std::process::exit(exit_code_for(&e));
         }
     }
 }
 
 #[cfg(test)]
+// Tests panic on purpose; the workspace lints deny that only in production code.
+#[cfg_attr(
+    test,
+    expect(clippy::unwrap_used, clippy::panic, reason = "assertions in tests")
+)]
 mod record_export_tests {
     use super::write_record_export;
     use std::{fs, io::ErrorKind, sync::Barrier, thread};

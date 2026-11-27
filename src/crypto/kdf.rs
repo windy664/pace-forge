@@ -9,8 +9,11 @@
 // 下面这些 `& 0xFFFF_FFFF` 在 u32 上没有实际作用，是照抄 Java 原实现留下的：
 // Java 的位运算会自动提升到 int，原作者显式截断回 32 位以保语义。删掉它们
 // 结果完全一样，但会和反编译出来的实现失去逐字对照，改动时更容易看漏。
-// 所以保留写法，用 allow 关掉这条 lint。
-#![allow(clippy::identity_op)]
+// 所以保留写法，用 expect 关掉这条 lint（哪天这些掩码被删光，expect 会提醒把这里也删掉）。
+#![expect(
+    clippy::identity_op,
+    reason = "the redundant `& 0xFFFF_FFFF` masks mirror the decompiled Java byte for byte"
+)]
 
 /// 自定义滚动哈希。与 FNV/Pearson 都不同，是易盾自己的构造。
 fn byte_hash(data: &[u8]) -> u32 {

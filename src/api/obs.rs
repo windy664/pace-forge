@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 
 use super::client::{Client, expect_ok};
 use crate::crypto::consts::hosts;
+use crate::error::{Error, ErrorKind};
 
 /// OBS 签名接口路径。
 pub const OBS_SIGN_PATH: &str = "/api/obs/temporary/url";
@@ -19,7 +20,7 @@ pub const OBS_SIGN_PATH: &str = "/api/obs/temporary/url";
 pub const BUCKET: &str = "iydsj-hbase-hot";
 
 /// 换签名 URL。
-pub fn sign_url(client: &Client, method: &str, key: &str) -> Result<String, String> {
+pub fn sign_url(client: &Client, method: &str, key: &str) -> Result<String, Error> {
     let body = json!({
         "bucketName": BUCKET,
         "objectKey": key,
@@ -38,31 +39,33 @@ pub fn sign_url(client: &Client, method: &str, key: &str) -> Result<String, Stri
     let signed = if let Some(s) = data.get("signedUrl").and_then(|x| x.as_str()) {
         s.to_string()
     } else if let Some(s) = data.as_str() {
-        let parsed: Value =
-            serde_json::from_str(s).map_err(|e| format!("签名响应解析失败: {e}"))?;
+        let parsed: Value = serde_json::from_str(s)
+            .map_err(|e| ErrorKind::protocol(format!("签名响应解析失败: {e}")))?;
         parsed
             .get("signedUrl")
             .and_then(|x| x.as_str())
-            .ok_or("OBS 签名响应缺 signedUrl")?
+            .ok_or_else(|| ErrorKind::protocol("OBS 签名响应缺 signedUrl".into()))?
             .to_string()
     } else if let Some(s) = v.get("signedUrl").and_then(|x| x.as_str()) {
         s.to_string()
     } else {
-        return Err("OBS 签名响应缺 signedUrl".into());
+        return Err(ErrorKind::protocol("OBS 签名响应缺 signedUrl".into()));
     };
     Ok(signed)
 }
 
 /// PUT 上传。
-pub fn put_object(signed_url: &str, payload: &[u8]) -> Result<(), String> {
+pub fn put_object(signed_url: &str, payload: &[u8]) -> Result<(), Error> {
     // ureq/rustls 对腾讯 COS 端点握手偶发 "tls connection init failed:
     // unexpected end of file"（curl 直连正常，说明是客户端侧的间歇性握手
     // 失败）。一次抖动就够让明细整条传不上去，详情页于是没有步频和轨迹。
     // 每次新建 agent 重试，退避递增。
-    let mut last = String::new();
+    let mut last: Option<Error> = None;
     for attempt in 0..4 {
         if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(300 * attempt as u64));
+            std::thread::sleep(std::time::Duration::from_millis(
+                300 * u64::try_from(attempt).unwrap_or(0),
+            ));
         }
         let agent = crate::api::egress::with_extra_ca(
             ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(30)),
@@ -75,11 +78,13 @@ pub fn put_object(signed_url: &str, payload: &[u8]) -> Result<(), String> {
         {
             Ok(_) => return Ok(()),
             // 服务端给了状态码就是明确拒绝（签名过期、桶权限），重试没用
-            Err(e @ ureq::Error::Status(..)) => return Err(format!("OBS PUT 失败: {e}")),
-            Err(e) => last = format!("OBS PUT 失败: {e}"),
+            Err(e @ ureq::Error::Status(..)) => {
+                return Err(ErrorKind::network(format!("OBS PUT 失败: {e}")));
+            }
+            Err(e) => last = Some(ErrorKind::network(format!("OBS PUT 失败: {e}"))),
         }
     }
-    Err(last)
+    Err(last.unwrap_or_else(|| ErrorKind::network("OBS 请求没有发出".to_string())))
 }
 
 /// 上传到多个 objectKey，返回成功个数。
@@ -117,13 +122,15 @@ pub fn upload_keys(client: &Client, keys: &[String], payload: &[u8]) -> (usize, 
 }
 
 /// 回读校验。
-pub fn fetch_object(client: &Client, key: &str) -> Result<Value, String> {
+pub fn fetch_object(client: &Client, key: &str) -> Result<Value, Error> {
     let signed = sign_url(client, "Get", key)?;
     // 同 put_object：握手抖动重试，404 这类状态码不重试（那是对象真的不存在）
-    let mut last = String::new();
+    let mut last: Option<Error> = None;
     for attempt in 0..4 {
         if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(300 * attempt as u64));
+            std::thread::sleep(std::time::Duration::from_millis(
+                300 * u64::try_from(attempt).unwrap_or(0),
+            ));
         }
         let agent = crate::api::egress::with_extra_ca(
             ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(30)),
@@ -133,14 +140,17 @@ pub fn fetch_object(client: &Client, key: &str) -> Result<Value, String> {
             Ok(resp) => {
                 let text = resp
                     .into_string()
-                    .map_err(|e| format!("OBS 读取失败: {e}"))?;
-                return serde_json::from_str(&text).map_err(|e| format!("OBS 对象解析失败: {e}"));
+                    .map_err(|e| ErrorKind::network(format!("OBS 读取失败: {e}")))?;
+                return serde_json::from_str(&text)
+                    .map_err(|e| ErrorKind::protocol(format!("OBS 对象解析失败: {e}")));
             }
-            Err(e @ ureq::Error::Status(..)) => return Err(format!("OBS GET 失败: {e}")),
-            Err(e) => last = format!("OBS GET 失败: {e}"),
+            Err(e @ ureq::Error::Status(..)) => {
+                return Err(ErrorKind::network(format!("OBS GET 失败: {e}")));
+            }
+            Err(e) => last = Some(ErrorKind::network(format!("OBS GET 失败: {e}"))),
         }
     }
-    Err(last)
+    Err(last.unwrap_or_else(|| ErrorKind::network("OBS 请求没有发出".to_string())))
 }
 
 /// 服务端所在时区偏移（秒）。
@@ -152,13 +162,10 @@ pub fn fetch_object(client: &Client, key: &str) -> Result<Value, String> {
 /// （比如按顺序通过点位）自然全假，而提交本身返回成功、里程时长步频
 /// 配速四项全过，很容易把排查带到别处。
 ///
-/// 跨时区部署时用 `PACE_TZ_OFFSET_SEC` 覆盖，别硬编码。
+/// 跨时区部署时用配置 `network.tz_offset_sec`（env `PACE_TZ_OFFSET_SEC`）
+/// 覆盖，别硬编码；±20 小时范围在配置加载时校验。
 pub(crate) fn tz_offset_sec() -> i64 {
-    std::env::var("PACE_TZ_OFFSET_SEC")
-        .ok()
-        .and_then(|v| v.parse::<i64>().ok())
-        .filter(|v| (-72_000..=72_000).contains(v))
-        .unwrap_or(8 * 3600)
+    crate::config::global().network.tz_offset_sec
 }
 
 /// 生成 objectKey（详情页格式，本地时区）。
@@ -195,13 +202,13 @@ pub fn fallback_key(uid: &str, sport_type: i32, start_sec: i64, uuid: &str) -> S
 pub(crate) fn civil_from_days(days: i64, hour: i64) -> (i64, u32, u32, i64) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
+    let doe = crate::number::i64_to_u64(z - era * 146_097).unwrap_or(0);
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
+    let y = crate::number::u64_to_i64(yoe).unwrap_or(0) + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let d = u32::try_from(doy - (153 * mp + 2) / 5 + 1).unwrap_or(1);
+    let m = u32::try_from(if mp < 10 { mp + 3 } else { mp - 9 }).unwrap_or(1);
     (if m <= 2 { y + 1 } else { y }, m, d, hour)
 }
 

@@ -14,9 +14,13 @@ use serde_json::{Value, json};
 
 use super::client::{Client, expect_ok, uuid_v4};
 use crate::crypto::consts::hosts;
+use crate::error::Error;
 
+/// AI 运动项目列表接口。
 pub const AI_LIST_PATH: &str = "/api/v1/sport/ai/list";
+/// AI 运动记录上传接口。
 pub const AI_UPLOAD_PATH: &str = "/api/v65/sport/ai/record/upload";
+/// AI 运动记录列表接口。
 pub const AI_RECORDS_PATH: &str = "/api/v66/sport/ai/record/infos";
 
 /// 真人记录区间取来的常量（neko 标定）：持续频率 90 个/分、单次 240ms。
@@ -28,25 +32,30 @@ const MIN_DURATION_MS: i64 = 30_000;
 /// AI 运动项目。
 #[derive(Debug, Clone)]
 pub struct AiSport {
+    /// 项目 id，提交时原样带回。
     pub id: i64,
+    /// 项目名，仅展示。
     pub name: String,
 }
 
 /// 提交意图：按分钟或按次数。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AiMode {
+    /// 按分钟计成绩，参数是分钟数。
     Minutes(i64),
+    /// 按次数计成绩，参数是次数。
     Count(i64),
 }
 
 /// 项目详情：`type` 决定成绩语义（1 计次 / 2 计时）。
 #[derive(Debug, Clone, Copy)]
 pub struct SportInfo {
+    /// 成绩类型：1 计次 / 2 计时。
     pub sport_type: i64,
 }
 
 /// 拉项目列表。
-pub fn fetch_list(client: &Client) -> Result<Vec<AiSport>, String> {
+pub fn fetch_list(client: &Client) -> Result<Vec<AiSport>, Error> {
     let raw = client.request(
         "GET",
         &format!("{}{}", hosts::RUN, AI_LIST_PATH),
@@ -108,23 +117,31 @@ pub fn record_fields(
         // 计时类：score=用时毫秒；个数只用来推 speed/时长
         (2, AiMode::Minutes(mins)) => {
             let ms = mins * 60_000;
-            let reps = (REPS_PER_MIN * mins as f64 * jitter).round() as i64;
-            let speed = (reps as f64 / (ms as f64 / 1000.0) * 60.0).round() as i64;
+            let reps =
+                crate::number::round_to_i64(REPS_PER_MIN * mins as f64 * jitter).unwrap_or(0);
+            let speed =
+                crate::number::round_to_i64(reps as f64 / (ms as f64 / 1000.0) * 60.0).unwrap_or(0);
             (2, ms.to_string(), ms, speed, (ms / 1000) as f64 * 0.2)
         }
         (2, AiMode::Count(reps)) => {
-            let ms = ((reps as f64 * MS_PER_REP * jitter) as i64).max(MIN_DURATION_MS);
-            let speed = (reps as f64 / (ms as f64 / 1000.0) * 60.0).round() as i64;
+            let ms = crate::number::f64_to_i64(reps as f64 * MS_PER_REP * jitter)
+                .unwrap_or(0)
+                .max(MIN_DURATION_MS);
+            let speed =
+                crate::number::round_to_i64(reps as f64 / (ms as f64 / 1000.0) * 60.0).unwrap_or(0);
             (2, ms.to_string(), ms, speed, (ms / 1000) as f64 * 0.2)
         }
         // 计次类：score=个数；speed 固定 0
         (_, AiMode::Minutes(mins)) => {
-            let reps = (REPS_PER_MIN * mins as f64 * jitter).round() as i64;
+            let reps =
+                crate::number::round_to_i64(REPS_PER_MIN * mins as f64 * jitter).unwrap_or(0);
             let ms = mins * 60_000;
             (1, reps.to_string(), ms, 0, reps as f64 * 0.07)
         }
         (_, AiMode::Count(reps)) => {
-            let ms = (((reps as f64 / REPS_PER_MIN) * 60_000.0) as i64).max(MIN_DURATION_MS);
+            let ms = crate::number::trunc_to_i64(reps as f64 / REPS_PER_MIN * 60_000.0)
+                .unwrap_or(0)
+                .max(MIN_DURATION_MS);
             (1, reps.to_string(), ms, 0, reps as f64 * 0.07)
         }
     };
@@ -154,10 +171,10 @@ pub fn upload(
     sport_id: i64,
     mode: AiMode,
     at: Option<i64>,
-) -> Result<Value, String> {
+) -> Result<Value, Error> {
     use rand::Rng;
     let info = fetch_info(client, sport_id);
-    let now = crate::crypto::envelope::now_ms() as i64;
+    let now = crate::crypto::envelope::now_ms();
     let jitter = 0.9 + rand::rng().random::<f64>() * 0.2;
     let body = record_fields(info.sport_type, mode, sport_id, jitter, now, at, &uuid_v4());
     let raw = client.request(
@@ -169,7 +186,7 @@ pub fn upload(
 }
 
 /// 拉某项目的记录（按天分组），返回 data 原样供 CLI 展示。
-pub fn fetch_records(client: &Client, sport_id: i64, page_size: i64) -> Result<Value, String> {
+pub fn fetch_records(client: &Client, sport_id: i64, page_size: i64) -> Result<Value, Error> {
     let path = format!(
         "{}{}?sportId={sport_id}&pageSize={page_size}&pageNum=1",
         hosts::RUN,

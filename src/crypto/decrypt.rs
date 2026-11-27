@@ -15,6 +15,7 @@
 //! **验签默认强制**（fail-closed）：验不过就报错，不返回可能被篡改的数据。
 //! 这与上游实现一致——宁可失败，也不要静默接受一个来路不明的响应。
 
+use crate::error::{Error, ErrorKind};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
 use md5::{Digest, Md5};
@@ -43,53 +44,62 @@ pub fn open(
     wire: &str,
     session: &SessionKeys,
     require_signature: bool,
-) -> Result<DecryptedResponse, String> {
-    let v: serde_json::Value =
-        serde_json::from_str(wire).map_err(|e| format!("响应不是合法 JSON: {e}"))?;
+) -> Result<DecryptedResponse, Error> {
+    let v: serde_json::Value = serde_json::from_str(wire)
+        .map_err(|e| ErrorKind::protocol(format!("响应不是合法 JSON: {e}")))?;
 
     // 1. 版本校验
     let ver = v.get("v").and_then(|x| x.as_i64());
     if ver != Some(101) {
-        return Err(format!("响应版本不是 101，实为 {ver:?}"));
+        return Err(ErrorKind::protocol(format!(
+            "响应版本不是 101，实为 {ver:?}"
+        )));
     }
 
     // 2. AES 解密
-    let r = v.get("r").and_then(|x| x.as_str()).ok_or("响应缺 r 字段")?;
+    let r = v
+        .get("r")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| ErrorKind::protocol("响应缺 r 字段".into()))?;
     let cipher = B64
         .decode(r)
-        .map_err(|e| format!("r 不是合法 base64: {e}"))?;
+        .map_err(|e| ErrorKind::protocol(format!("r 不是合法 base64: {e}")))?;
     let plain_padded = Aes128CbcDec::new_from_slices(&session.response_key, &[0u8; 16])
-        .map_err(|e| format!("AES 初始化失败: {e}"))?
+        .map_err(|e| ErrorKind::protocol(format!("AES 初始化失败: {e}")))?
         .decrypt_padded_vec_mut::<Pkcs7>(&cipher)
-        .map_err(|_| "PKCS#7 去填充失败（响应 key 不匹配？）".to_string())?;
+        .map_err(|_| ErrorKind::protocol("PKCS#7 去填充失败（响应 key 不匹配？）".into()))?;
 
     // 3. 验签
     let signature_ok = match v.get("s").and_then(|x| x.as_str()) {
         Some(s) if !s.is_empty() => {
             let ok = verify_signature(&plain_padded, s)?;
             if require_signature && !ok {
-                return Err("响应签名校验失败，数据可能被篡改".into());
+                return Err(ErrorKind::protocol(
+                    "响应签名校验失败，数据可能被篡改".into(),
+                ));
             }
             Some(ok)
         }
         _ => {
             if require_signature {
-                return Err("响应缺 s 字段，强制验签模式下不接受".into());
+                return Err(ErrorKind::protocol(
+                    "响应缺 s 字段，强制验签模式下不接受".into(),
+                ));
             }
             None
         }
     };
 
     // 4. 内层 data
-    let inner: serde_json::Value =
-        serde_json::from_slice(&plain_padded).map_err(|e| format!("内层明文不是 JSON: {e}"))?;
+    let inner: serde_json::Value = serde_json::from_slice(&plain_padded)
+        .map_err(|e| ErrorKind::protocol(format!("内层明文不是 JSON: {e}")))?;
     let data_b64 = inner
         .get("data")
         .and_then(|x| x.as_str())
-        .ok_or("内层缺 data 字段")?;
+        .ok_or_else(|| ErrorKind::protocol("内层缺 data 字段".into()))?;
     let body_bytes = B64
         .decode(data_b64)
-        .map_err(|e| format!("data 不是合法 base64: {e}"))?;
+        .map_err(|e| ErrorKind::protocol(format!("data 不是合法 base64: {e}")))?;
     let body = String::from_utf8_lossy(&body_bytes).into_owned();
 
     Ok(DecryptedResponse { body, signature_ok })
@@ -100,23 +110,23 @@ pub fn open(
 /// 手工做模幂与填充检查，而不是走 `rsa` crate 的 VerifyingKey——
 /// 因为后者要求摘要类型实现 `AssociatedOid`，而我们要精确复刻服务端的
 /// 「MD5 + PKCS#1 v1.5 原始签名」语义。
-fn verify_signature(plaintext: &[u8], sig_b64: &str) -> Result<bool, String> {
+fn verify_signature(plaintext: &[u8], sig_b64: &str) -> Result<bool, Error> {
     let der = B64
         .decode(RESP_VERIFY_SPKI_B64)
-        .map_err(|e| format!("响应公钥 base64 解码失败: {e}"))?;
-    let pubkey =
-        RsaPublicKey::from_public_key_der(&der).map_err(|e| format!("响应公钥解析失败: {e}"))?;
+        .map_err(|e| ErrorKind::protocol(format!("响应公钥 base64 解码失败: {e}")))?;
+    let pubkey = RsaPublicKey::from_public_key_der(&der)
+        .map_err(|e| ErrorKind::protocol(format!("响应公钥解析失败: {e}")))?;
 
     let sig = B64
         .decode(sig_b64)
-        .map_err(|e| format!("s 不是合法 base64: {e}"))?;
+        .map_err(|e| ErrorKind::protocol(format!("s 不是合法 base64: {e}")))?;
     let block_size = pubkey.n().bits().div_ceil(8);
     if sig.len() != block_size {
-        return Err(format!(
+        return Err(ErrorKind::protocol(format!(
             "签名长度 {} 与模数 {} 字节不匹配",
             sig.len(),
             block_size
-        ));
+        )));
     }
 
     let sig_int = rsa::BigUint::from_bytes_be(&sig);
@@ -181,7 +191,7 @@ mod tests {
         let s = SessionKeys::generate();
         let wire = r#"{"r":"AAAA","s":"","v":100}"#;
         let err = open(wire, &s, false).unwrap_err();
-        assert!(err.contains("101"), "应提示版本不符: {err}");
+        assert!(err.to_string().contains("101"), "应提示版本不符: {err}");
     }
 
     #[test]

@@ -1,3 +1,12 @@
+//! `pace-forge crosscheck` 的命令行回归：本地日切、时区提示和原始行号。
+
+// Integration tests panic on purpose; the workspace lints deny that only in production code.
+#![expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "assertions in tests"
+)]
+
 use std::{fs, process::Command};
 
 #[test]
@@ -21,8 +30,6 @@ fn crosscheck_uses_local_calendar_days_and_reports_invalid_timezone() {
     let cases = [
         ("28800", "跨 2 天", "UTC+08:00"),
         ("0", "跨 1 天", "UTC+00:00"),
-        ("invalid", "跨 2 天", "PACE_TZ_OFFSET_SEC 无效，用默认"),
-        ("72001", "跨 2 天", "PACE_TZ_OFFSET_SEC 无效，用默认"),
     ];
     let outputs = cases.map(|(offset, _, _)| {
         Command::new(env!("CARGO_BIN_EXE_pace-forge"))
@@ -31,6 +38,18 @@ fn crosscheck_uses_local_calendar_days_and_reports_invalid_timezone() {
             .env("PACE_TZ_OFFSET_SEC", offset)
             .output()
     });
+
+    // 非法时区偏移：旧实现静默回落默认，现在配置加载直接报错退出（fail-fast）
+    let invalid_offsets = ["invalid", "72001"];
+    let invalid_outputs = invalid_offsets.map(|offset| {
+        Command::new(env!("CARGO_BIN_EXE_pace-forge"))
+            .arg("crosscheck")
+            .arg(&path)
+            .env("PACE_TZ_OFFSET_SEC", offset)
+            .output()
+            .expect("spawn crosscheck")
+    });
+
     fs::remove_dir_all(directory).unwrap();
 
     for ((offset, span, timezone), output) in cases.into_iter().zip(outputs) {
@@ -40,6 +59,16 @@ fn crosscheck_uses_local_calendar_days_and_reports_invalid_timezone() {
         assert!(text.contains(span), "offset {offset}: {text}");
         assert!(text.contains(timezone), "offset {offset}: {text}");
         assert!(text.contains("8'00\"/km"), "offset {offset}: {text}");
+    }
+
+    for (offset, output) in invalid_offsets.into_iter().zip(invalid_outputs) {
+        assert!(
+            !output.status.success(),
+            "offset {offset} 应当拒绝启动而不是回落默认"
+        );
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(err.contains("配置加载失败"), "offset {offset}: {err}");
+        assert!(err.contains("PACE_TZ_OFFSET_SEC"), "offset {offset}: {err}");
     }
 }
 

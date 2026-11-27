@@ -29,8 +29,11 @@ pub enum Level {
 /// 一条检查结果。
 #[derive(Debug, Clone)]
 pub struct Issue {
+    /// 严重程度。
     pub level: Level,
+    /// 检查码。
     pub code: &'static str,
+    /// 给用户看的说明。
     pub message: String,
 }
 
@@ -61,6 +64,7 @@ impl Issue {
 /// 自检报告。
 #[derive(Debug, Clone)]
 pub struct Report {
+    /// 全部检查结果。
     pub issues: Vec<Issue>,
 }
 
@@ -70,6 +74,7 @@ impl Report {
         self.issues.iter().any(|i| i.level == Level::Fatal)
     }
 
+    /// 致命问题数（非零就不能提交）。
     pub fn fatal_count(&self) -> usize {
         self.issues
             .iter()
@@ -77,6 +82,7 @@ impl Report {
             .count()
     }
 
+    /// 警告数。
     pub fn warn_count(&self) -> usize {
         self.issues
             .iter()
@@ -113,8 +119,11 @@ impl Report {
 
 /// 自检输入。
 pub struct Check<'a> {
+    /// 轨迹点。
     pub points: &'a [TrackPoint],
+    /// 合成的分桶与步数。
     pub sim: &'a SimResult,
+    /// 合成参数。
     pub params: &'a SimParams,
     /// 必过的打卡点（纬度, 经度, 名称）。
     pub checkpoints: &'a [(f64, f64, String)],
@@ -126,6 +135,7 @@ pub struct Check<'a> {
     pub total_steps: i32,
     /// 报文里的起止时间戳。
     pub start_time_ms: i64,
+    /// 报文里的结束时间戳。
     pub stop_time_ms: i64,
     /// 服务端规则允许的配速区间（分/公里），`None` 表示不校验。
     pub pace_range: Option<(f64, f64)>,
@@ -171,7 +181,34 @@ pub fn inspect(c: &Check) -> Report {
 pub fn inspect_at(c: &Check, now_ms: Option<i64>) -> Report {
     let mut issues = Vec::new();
 
-    // ── 一、时间轴 ──
+    check_timeline(c, now_ms, &mut issues);
+
+    if c.points.is_empty() {
+        issues.push(Issue::fatal("TRACK_EMPTY", "轨迹为空"));
+        return Report { issues };
+    }
+
+    check_point_times(c, &mut issues);
+
+    check_distance_and_geo(c, &mut issues);
+
+    check_checkpoints(c, &mut issues);
+
+    check_buckets(c, &mut issues);
+
+    check_sampling(c, &mut issues);
+
+    check_physics(c, &mut issues);
+
+    check_totals(c, &mut issues);
+
+    check_startup(c, &mut issues);
+
+    Report { issues }
+}
+
+/// 一、时间轴：起止缺失/顺序、时长与日期、末日判据。
+fn check_timeline(c: &Check, now_ms: Option<i64>, issues: &mut Vec<Issue>) {
     if c.start_time_ms <= 0 || c.stop_time_ms <= 0 {
         issues.push(Issue::fatal("TIME_MISSING", "起止时间戳缺失"));
     } else if c.stop_time_ms <= c.start_time_ms {
@@ -203,13 +240,10 @@ pub fn inspect_at(c: &Check, now_ms: Option<i64>) -> Report {
             ));
         }
     }
+}
 
-    if c.points.is_empty() {
-        issues.push(Issue::fatal("TRACK_EMPTY", "轨迹为空"));
-        return Report { issues };
-    }
-
-    // 首尾时间戳必须精确落在报文声明的边界上
+/// 首尾时间戳必须落在报文声明的边界上，且整条严格递增。
+fn check_point_times(c: &Check, issues: &mut Vec<Issue>) {
     let first_t = c.points.first().map(|p| p.time_ms).unwrap_or(0);
     let last_t = c.points.last().map(|p| p.time_ms).unwrap_or(0);
     if first_t != c.start_time_ms {
@@ -238,8 +272,10 @@ pub fn inspect_at(c: &Check, now_ms: Option<i64>) -> Report {
             format!("{dup} 处时间戳未严格递增"),
         ));
     }
+}
 
-    // ── 二、里程 ──
+/// 二/三：里程与坐标（折线实测、越界、相邻点瞬移）。
+fn check_distance_and_geo(c: &Check, issues: &mut Vec<Issue>) {
     let xy: Vec<(f64, f64)> = c.points.iter().map(|p| (p.lat, p.lon)).collect();
     let measured = super::geo::path_length(&xy);
     let declared = c.total_distance_m as f64;
@@ -286,8 +322,10 @@ pub fn inspect_at(c: &Check, now_ms: Option<i64>) -> Report {
             format!("相邻点最大跳变 {max_jump:.0}m，偏大"),
         ));
     }
+}
 
-    // ── 四、打卡点 ──
+/// 四、打卡点：每个必到点必须有一个采样点落在 0.5m 内。
+fn check_checkpoints(c: &Check, issues: &mut Vec<Issue>) {
     for (lat, lng, name) in c.checkpoints {
         let best = c
             .points
@@ -301,8 +339,10 @@ pub fn inspect_at(c: &Check, now_ms: Option<i64>) -> Report {
             ));
         }
     }
+}
 
-    // ── 五、分桶 ──
+/// 五、分桶：数量、步数合计、连续空桶、自相关。
+fn check_buckets(c: &Check, issues: &mut Vec<Issue>) {
     let expect_buckets = (c.total_time_sec / 10).max(1) as usize;
     if c.sim.speed_buckets.len() != expect_buckets {
         issues.push(Issue::fatal(
@@ -368,8 +408,10 @@ pub fn inspect_at(c: &Check, now_ms: Option<i64>) -> Report {
             }
         }
     }
+}
 
-    // ── 五之二、上报采样节奏 ──
+/// 五之二、上报采样节奏：中位间隔、过密插点、配置偏离真机。
+fn check_sampling(c: &Check, issues: &mut Vec<Issue>) {
     //
     // 这条检查以前只写在文档和注释里（「硬判定在 preflight 的 SAMPLE_RATE」），
     // 代码里根本没有——于是把 `sample_interval_sec` 配错、或者采样器把拐角
@@ -414,8 +456,10 @@ pub fn inspect_at(c: &Check, now_ms: Option<i64>) -> Report {
             ));
         }
     }
+}
 
-    // ── 六、物理合理性 ──
+/// 六、物理合理性：配速区间（均值/逐点/桶级）、步频、步态、步幅。
+fn check_physics(c: &Check, issues: &mut Vec<Issue>) {
     let avg_v = c.total_distance_m as f64 / c.total_time_sec.max(1) as f64;
     // 配速：分/公里
     let pace = 1000.0 / avg_v / 60.0;
@@ -582,8 +626,10 @@ pub fn inspect_at(c: &Check, now_ms: Option<i64>) -> Report {
             format!("推算步幅 {stride:.2}m 超出常见范围"),
         ));
     }
+}
 
-    // ── 七、里程与时长的一致性 ──
+/// 七、里程与时长的一致性。
+fn check_totals(c: &Check, issues: &mut Vec<Issue>) {
     if c.total_time_sec <= 0 {
         issues.push(Issue::fatal("DURATION", "totalTime 必须为正"));
     }
@@ -599,8 +645,10 @@ pub fn inspect_at(c: &Check, now_ms: Option<i64>) -> Report {
             ),
         ));
     }
+}
 
-    // ── 起步窗口的外推范围 ──
+/// 起步窗口按 15.5% 外推的提示（超过真机样本范围只提示）。
+fn check_startup(c: &Check, issues: &mut Vec<Issue>) {
     //
     // 起步窗口按总时长的 15.5% 算，这个比例只来自一份 555 秒的真机样本
     // （窗口 86 秒）。更长的记录没有对照，外推出来的秒数、以及那段时间里
@@ -619,8 +667,6 @@ pub fn inspect_at(c: &Check, now_ms: Option<i64>) -> Report {
             ));
         }
     }
-
-    Report { issues }
 }
 
 #[cfg(test)]

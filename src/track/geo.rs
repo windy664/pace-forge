@@ -12,6 +12,7 @@ pub fn m_per_deg_lat(_lat: f64) -> f64 {
     111_320.0
 }
 
+/// 该纬度上经度差 1° 对应的东西向米数。
 pub fn m_per_deg_lng(lat: f64) -> f64 {
     M_PER_DEG_LAT * lat.to_radians().cos().abs().max(0.1)
 }

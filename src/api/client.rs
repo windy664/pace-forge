@@ -15,6 +15,7 @@ use serde_json::Value;
 
 use crate::crypto::envelope::{SessionKeys, seal};
 use crate::crypto::{SignFields, decrypt, sign::token_sign};
+use crate::error::{Error, ErrorKind};
 use sha2::{Digest, Sha256};
 
 /// 可选硬件标识头的开关。
@@ -32,11 +33,12 @@ use sha2::{Digest, Sha256};
 /// 注意 `CustomDeviceId` 也在内：方法前面虽然 `Utils.OoooOo0(context, ...)`
 /// 生成过一个值存进缓存，但最后 put 进头的仍是 `""`。
 ///
-/// 要发派生假值做对照时设 `PACE_DEVICE_HW_HEADERS=derived`。
+/// 要发派生假值做对照时设 `device.hw_headers = "derived"`（env
+/// `PACE_DEVICE_HW_HEADERS=derived`）。
 fn hw_id(value: &str) -> String {
-    match std::env::var("PACE_DEVICE_HW_HEADERS").ok().as_deref() {
-        Some("derived") | Some("1") | Some("true") => value.to_string(),
-        _ => String::new(),
+    match crate::config::global().device.hw_headers {
+        crate::config::HwHeaders::Derived => value.to_string(),
+        crate::config::HwHeaders::Empty => String::new(),
     }
 }
 
@@ -62,15 +64,25 @@ fn luhn_check_digit(body: &[u8]) -> u8 {
 /// 设备指纹。首次运行随机生成后应持久化，否则容易被判为异常设备。
 #[derive(Debug, Clone)]
 pub struct DeviceProfile {
+    /// App 版本号，要和服务端校验的那一套对得上。
     pub app_version: String,
+    /// 物理分辨率，形如 `1080x2400`。
     pub physic_pixel: String,
+    /// 逻辑分辨率。
     pub logic_pixel: String,
+    /// 是否 root：`0` / `1`。
     pub is_root: String,
+    /// 系统类型（`android`）。
     pub os_type: String,
+    /// SoC 型号，对应机型表里的 `soc`。
     pub cpu_model: String,
+    /// 设备名（`Pixel 6` 这类）。
     pub device_name: String,
+    /// 设备唯一 id。
     pub device_id: String,
+    /// 系统版本（`13`）。
     pub os_version: String,
+    /// 请求头里的 UA。
     pub user_agent: String,
     /// 安卓安装 ID：真机是 16 位小写 hex。
     ///
@@ -194,17 +206,13 @@ impl DeviceProfile {
             device_id: String::new(),
             // 真机装的就是这个版本（7.4.20 / code 411，2026-11 从设备上取）。
             // 发旧版本号等于自报「用老客户端」，服务端的版本校验会直接看出来。
-            // 需要对照实验时用 PACE_APP_VERSION 覆盖。
-            app_version: std::env::var("PACE_APP_VERSION")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "7.4.20".into()),
+            // 需要对照实验时用配置 device.app_version（env PACE_APP_VERSION）覆盖。
+            app_version: crate::config::global().device.app_version.clone(),
             physic_pixel: "1080x2400".into(),
             logic_pixel: "393x873".into(),
             is_root: "0".into(),
             os_type: "0".into(),
-            cpu_model: crate::api::device_table::cpu_model_from_env(),
+            cpu_model: crate::api::device_table::cpu_model(),
             device_name: "Android Device".into(),
             os_version: "13".into(),
             user_agent: "okhttp/4.12.0".into(),
@@ -285,7 +293,7 @@ pub(crate) fn device_model_in(base: &std::path::Path, scope: &str) -> Option<Str
 }
 
 /// 写账号级机型。`None` 或空串表示清掉（回到 ABI）。
-pub fn save_account_model(scope: &str, model: Option<&str>) -> Result<(), String> {
+pub fn save_account_model(scope: &str, model: Option<&str>) -> Result<(), Error> {
     let base = crate::api::session::home_dir();
     save_account_model_in(&base, scope, model)
 }
@@ -294,14 +302,17 @@ pub(crate) fn save_account_model_in(
     base: &std::path::Path,
     scope: &str,
     model: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let path = device_model_path_in(base, scope);
     match model.map(str::trim).filter(|m| !m.is_empty()) {
         Some(m) => crate::api::session::write_file_private(&path, m.as_bytes()),
         None => match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(format!("清机型配置失败 {}: {e}", path.display())),
+            Err(e) => Err(ErrorKind::client(format!(
+                "清机型配置失败 {}: {e}",
+                path.display()
+            ))),
         },
     }
 }
@@ -375,15 +386,20 @@ fn random_hex32() -> String {
 /// 鉴权凭据。
 #[derive(Debug, Clone, Default)]
 pub struct Credentials {
+    /// 用户 id。
     pub uid: Option<String>,
+    /// 登录 token。
     pub token: Option<String>,
+    /// 会话标识。
     pub unid: Option<String>,
 }
 
 /// 协议客户端。
 #[derive(Clone)]
 pub struct Client {
+    /// 设备指纹，随每个请求发出。
     pub device: DeviceProfile,
+    /// 鉴权凭据，未登录时全空。
     pub creds: Credentials,
     /// 强制验签。
     ///
@@ -392,10 +408,12 @@ pub struct Client {
     /// 接口整体失败。已用 Python 实现实测确认：不验签时三个接口全部 error=10000。
     /// 需要完整性保证时再打开。
     pub require_signature: bool,
+    /// HTTP 客户端（带代理、超时、证书配置）。
     pub agent: ureq::Agent,
 }
 
 impl Client {
+    /// 按设备指纹建一个未登录的客户端。
     pub fn new(device: DeviceProfile) -> Self {
         Self {
             device,
@@ -416,6 +434,7 @@ impl Client {
         }
     }
 
+    /// 带上凭据（builder 风格）。
     pub fn with_credentials(mut self, creds: Credentials) -> Self {
         self.creds = creds;
         self
@@ -424,10 +443,10 @@ impl Client {
     /// 组装请求头，返回 (headers, headerSign 会话)。
     ///
     /// `headerSign` 的会话密钥必须保留——响应是用它解密的。
-    fn build_headers(&self) -> Result<(Vec<(String, String)>, SessionKeys), String> {
+    fn build_headers(&self) -> Result<(Vec<(String, String)>, SessionKeys), Error> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| format!("系统时间异常: {e}"))?
+            .map_err(|e| ErrorKind::client(format!("系统时间异常: {e}")))?
             .as_millis() as u64;
         let nonce = uuid_v4();
 
@@ -503,26 +522,30 @@ impl Client {
     ///
     /// 返回业务 JSON 字符串（已解密）。HTTP 非 2xx 也会尝试解密，
     /// 因为服务端有时在错误响应里同样使用加密信封。
-    pub fn request(&self, method: &str, url: &str, body: Option<&Value>) -> Result<String, String> {
+    pub fn request(&self, method: &str, url: &str, body: Option<&Value>) -> Result<String, Error> {
         self.request_with_headers(method, url, body, &[])
     }
 
     /// 带额外请求头的版本。登录需要 `Authorization: Basic ...`，
     /// 这类头不参与 `headerSign` 的计算（服务端只对设备头做信封）。
+    ///
+    /// 错误在此处一次性分类（#62）：厂商业务码走
+    /// [`ErrorKind::classify_vendor`]，传输层失败归 `Network`，本地构造失败
+    /// 归 `Client`，响应体损坏归 `Protocol`/`Json`。
     pub fn request_with_headers(
         &self,
         method: &str,
         url: &str,
         body: Option<&Value>,
         extra_headers: &[(&str, &str)],
-    ) -> Result<String, String> {
+    ) -> Result<String, Error> {
         let (headers, session) = self.build_headers()?;
 
         let mut req = match method.to_uppercase().as_str() {
             "GET" => self.agent.get(url),
             "POST" => self.agent.post(url),
             "PUT" => self.agent.put(url),
-            m => return Err(format!("不支持的 method: {m}")),
+            m => return Err(ErrorKind::Client(format!("不支持的 method: {m}"))),
         };
         for (k, v) in &headers {
             req = req.set(k, v);
@@ -535,8 +558,7 @@ impl Client {
         // 所以 body 信封派生出的 key 直接丢弃——服务端不用它加密响应。
         let resp = match body {
             Some(b) => {
-                let plain =
-                    serde_json::to_string(b).map_err(|e| format!("body 序列化失败: {e}"))?;
+                let plain = serde_json::to_string(b).map_err(ErrorKind::Json)?;
                 let body_env = seal(&plain)?;
                 req.send_string(&body_env.wire)
             }
@@ -544,13 +566,20 @@ impl Client {
         };
 
         let (status, text) = match resp {
-            Ok(r) => (r.status(), r.into_string().map_err(|e| e.to_string())?),
+            Ok(r) => (
+                r.status(),
+                r.into_string()
+                    .map_err(|e| ErrorKind::Network(e.to_string()))?,
+            ),
             Err(ureq::Error::Status(code, r)) => (code, r.into_string().unwrap_or_default()),
-            Err(e) => return Err(format!("网络错误: {e}")),
+            Err(e) => return Err(ErrorKind::Network(e.to_string())),
         };
 
         if text.trim().is_empty() {
-            return Err(format!("HTTP {status} 响应为空"));
+            return Err(ErrorKind::Protocol {
+                code: None,
+                msg: format!("HTTP {status} 响应为空"),
+            });
         }
         // 服务端集群故障的**第一道拦截**。
         //
@@ -561,11 +590,17 @@ impl Client {
         // 只剩「解密失败」「HTTP 500」，然后又去换网络重装（issue #3 那位
         // 折腾了两天说的就是这个）。所以在这里按原始文本先认一次。
         if let Some(msg) = server_fault_hint(&text, status) {
-            return Err(msg);
+            return Err(ErrorKind::Protocol {
+                code: Some(crate::crypto::CODE_SERVER_FAULT),
+                msg,
+            });
         }
         // 网关级错误（如 Spring 的 404 页）是明文且无加密信封，直接透出原文
         if text.contains("\"status\":404") || text.contains("No message available") {
-            return Err(format!("HTTP {status} 网关错误: {}", truncate(&text, 200)));
+            return Err(ErrorKind::Protocol {
+                code: None,
+                msg: format!("HTTP {status} 网关错误: {}", truncate(&text, 200)),
+            });
         }
 
         // 有些接口 decryptResponse=false，直接返回业务 JSON。探测：无 r 字段即明文。
@@ -576,10 +611,13 @@ impl Client {
 
         match decrypt::open(&text, &session, self.require_signature) {
             Ok(d) => Ok(d.body),
-            Err(e) => Err(format!(
-                "HTTP {status} 解密失败: {e}；原文 {} ",
-                truncate(&text, 120)
-            )),
+            Err(e) => Err(ErrorKind::Protocol {
+                code: None,
+                msg: format!(
+                    "HTTP {status} 解密失败: {e}；原文 {} ",
+                    truncate(&text, 120)
+                ),
+            }),
         }
     }
 }
@@ -618,8 +656,11 @@ pub fn server_fault_hint(text: &str, status: u16) -> Option<String> {
 }
 
 /// 便捷方法：解析业务 JSON 并检查 `error` 字段。
-pub fn expect_ok(body: &str) -> Result<Value, String> {
-    let v: Value = serde_json::from_str(body).map_err(|e| format!("业务响应不是 JSON: {e}"))?;
+///
+/// 厂商业务码在此分类（#62）：`-10000` 集群故障保留长说明并归 `Protocol`，
+/// 其余走 [`ErrorKind::classify_vendor`]。
+pub fn expect_ok(body: &str) -> Result<Value, Error> {
+    let v: Value = serde_json::from_str(body)?;
     let code = v.get("error").and_then(|x| x.as_i64());
     if code == Some(crate::crypto::CODE_OK) {
         return Ok(v);
@@ -633,20 +674,32 @@ pub fn expect_ok(body: &str) -> Result<Value, String> {
     // 不点明的话，用户会去换网络、重装、换账号、挂代理，全白费
     // （issue #3 里那位折腾了整整两天）。
     if code == Some(crate::crypto::CODE_SERVER_FAULT) {
-        return Err(format!(
-            "服务端集群故障（error=-10000），跟你这边无关，别折腾本地环境：{msg}\n\n\
-             这条错误是对方后端内部服务调用被拦（日志里通常带 \n\
-             `Forbid consumer x.x.x.x access service ... from registry ...:2181`），\n\
-             登录、查记录、拉策略会一起失败。\n\
-             换网络、换账号、重装、重新编译都没有用——等后端恢复即可。"
-        ));
+        return Err(ErrorKind::Protocol {
+            code: Some(crate::crypto::CODE_SERVER_FAULT),
+            msg: format!(
+                "服务端集群故障（error=-10000），跟你这边无关，别折腾本地环境：{msg}\n\n\
+                 这条错误是对方后端内部服务调用被拦（日志里通常带 \n\
+                 `Forbid consumer x.x.x.x access service ... from registry ...:2181`），\n\
+                 登录、查记录、拉策略会一起失败。\n\
+                 换网络、换账号、重装、重新编译都没有用——等后端恢复即可。"
+            ),
+        });
     }
     // 有的接口把 -10000 包在别的字段里（`r` / `data` / 纯文本 message），
     // 走到这儿 code 认不出来，但原始文本认得出来，别再给「业务错误」了。
     if let Some(hint) = server_fault_hint(msg, 200) {
-        return Err(hint);
+        return Err(ErrorKind::Protocol {
+            code: Some(crate::crypto::CODE_SERVER_FAULT),
+            msg: hint,
+        });
     }
-    Err(format!("业务错误 error={code:?} message={msg}"))
+    Err(match code {
+        Some(c) => ErrorKind::classify_vendor(c, msg),
+        None => ErrorKind::Protocol {
+            code: None,
+            msg: format!("业务错误 message={msg}"),
+        },
+    })
 }
 
 #[cfg(test)]
@@ -657,19 +710,20 @@ mod tests {
     /// 硬件头开关：**默认空串**（7.4.21 硬编码 `""`），设 `derived` 才发假值。
     #[test]
     fn hw_headers_default_empty_derived_on_demand() {
-        // edition 2024 要求 env 写操作显式 unsafe（多线程下改 env 不安全）；本测试只在这一个用例里读写这个变量。
-        unsafe {
-            std::env::remove_var("PACE_DEVICE_HW_HEADERS");
-            assert_eq!(
-                hw_id("abc"),
-                "",
-                "默认必须是空串（与 7.4.21 的 getHeaderMap 一致）"
-            );
-            std::env::set_var("PACE_DEVICE_HW_HEADERS", "derived");
-            assert_eq!(hw_id("abc"), "abc", "derived 时应发派生假值");
-            std::env::remove_var("PACE_DEVICE_HW_HEADERS");
-        }
-        assert_eq!(hw_id("abc"), "");
+        assert_eq!(
+            hw_id("abc"),
+            "",
+            "默认必须是空串（与 7.4.21 的 getHeaderMap 一致）"
+        );
+        // 配置注入（Guard 互斥，多个用 Guard 的测试不会互相覆盖）
+        let _g = crate::config::Guard::replace(crate::config::Config {
+            device: crate::config::Device {
+                hw_headers: crate::config::HwHeaders::Derived,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert_eq!(hw_id("abc"), "abc", "derived 时应发派生假值");
     }
 
     /// 回归（issue #16）：IMEI 必须 15 位并通过 Luhn。
@@ -858,17 +912,29 @@ mod tests {
     fn server_fault_is_explained_not_just_reported() {
         let body = r#"{"error":-10000,"message":"Forbid consumer 10.0.50.83 access service com.iydsj.server.basicuser.service.UserBasicService from registry 10.0.30.34:2181. Please check registry access list (whitelist/blacklist)"}"#;
         let e = expect_ok(body).unwrap_err();
-        assert!(e.contains("-10000"), "要带上原始错误码，方便搜：{e}");
-        assert!(e.contains("服务端"), "要说明是服务端的问题：{e}");
+        let text = e.to_string();
+        assert!(text.contains("-10000"), "要带上原始错误码，方便搜：{text}");
+        assert!(text.contains("服务端"), "要说明是服务端的问题：{text}");
         assert!(
-            e.contains("无关") && e.contains("没有用"),
-            "必须明确劝阻换网络/换账号/重装：{e}"
+            text.contains("无关") && text.contains("没有用"),
+            "必须明确劝阻换网络/换账号/重装：{text}"
         );
-        // 别的非零码仍然走原来的「业务错误」，不要被这条吞掉
+        // 集群故障是厂商侧问题，归类为 Protocol 并带上厂商码
+        assert!(
+            matches!(
+                e,
+                ErrorKind::Protocol {
+                    code: Some(-10000),
+                    ..
+                }
+            ),
+            "归类: {e:?}"
+        );
+        // 别的非零码仍然走分类：10121 归认证问题，不被集群故障吞掉
         let e2 = expect_ok(r#"{"error":10121,"message":"设备异常"}"#).unwrap_err();
         assert!(
-            e2.starts_with("业务错误"),
-            "10121 不该被当成服务端故障：{e2}"
+            matches!(e2, ErrorKind::Auth(_)),
+            "10121 应归类为认证问题：{e2}"
         );
     }
 

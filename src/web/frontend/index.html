@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>运动世界校园 · 记录看板</title>
+<script>
+(() => {
+  // 去掉旧书签里的口令参数，避免页面继续携带它。
+  const url = new URL(location.href);
+  if (url.searchParams.has('token')) {
+    url.searchParams.delete('token');
+    try { history.replaceState(null, '', url.href); }
+    catch (_) { location.replace(url.href); }
+  }
+})();
+</script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<link rel="stylesheet" href="/console.css">
+</head>
+<body>
+
+<!-- 登录 -->
+<div id="login">
+  <h1>运动世界校园</h1>
+  <form id="consoleUnlock" method="post" autocomplete="off" hidden>
+    <div class="field">
+      <label for="consoleToken">控制台口令</label>
+      <input id="consoleToken" type="password" required>
+    </div>
+    <button id="consoleUnlockBtn" type="submit">解锁控制台</button>
+    <div class="msg" id="consoleMsg" role="status"></div>
+  </form>
+  <div id="accountLogin">
+    <p class="sub">登录后查看跑步记录与轨迹</p>
+    <div class="field">
+      <label>手机号</label>
+      <input id="u" type="tel" autocomplete="username" placeholder="请输入手机号">
+    </div>
+    <div class="field">
+      <label>密码</label>
+      <input id="p" type="password" autocomplete="current-password" placeholder="请输入密码">
+    </div>
+    <button id="btn">登录并保存</button>
+    <div class="msg" id="msg"></div>
+  </div>
+  <p class="mark" id="loginTag">本地控制台</p>
+</div>
+
+<div id="picker" style="display:none"></div>
+
+<!-- 主界面 -->
+<div id="app" class="wrap">
+  <div class="topbar">
+    <span id="buildTag" title="构建版本">本地控制台</span>
+    <span id="egressTag" class="hint" style="font-weight:400" title="提交出口 IP 自检（加载中）">出口…</span>
+    <div class="avatar" id="ava" aria-hidden="true">·</div>
+    <div class="who">
+      <b id="uname">—</b>
+      <div id="uinfo">—</div>
+    </div>
+    <button class="ghost" id="semBtn">查学期</button>
+    <button class="ghost" id="reload">刷新记录</button>
+    <button class="ghost" id="logout" title="让服务端 token 失效；账号和密码都保留，下次点「重登」即可">退出登录</button>
+  </div>
+
+  <div class="panel" id="accPanel">
+    <h2>账号 <span id="accCount" class="hint" style="font-weight:400"></span></h2>
+    <div id="accList"><div class="empty"><span class="spin"></span> 读取账号…</div></div>
+    <div class="runform accrow-inputs" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--line-soft)">
+      <input id="accUser" type="tel" placeholder="手机号" aria-label="手机号">
+      <input id="accPass" type="password" placeholder="密码" aria-label="密码">
+      <button id="accAdd">添加</button>
+      <button class="ghost" id="accLoginAll">全部登录</button>
+      <button class="ghost" id="accBatch">批量刷</button>
+    </div>
+    <div id="accMsg" class="msg"></div>
+  </div>
+
+  <div class="panel" id="devPanel">
+    <h2>设备机型 <span class="hint" style="font-weight:400">cpuModel</span></h2>
+    <div class="kv"><span>当前发出</span><b id="devCpu">…</b></div>
+    <div class="kv"><span>机型来源</span><b id="devSrc" class="hint">未设置（ABI 兜底）</b></div>
+    <div class="runform" style="margin-top:8px">
+      <input id="devSearch" placeholder="搜型号定位：Xiaomi 13 / 2211133C" aria-label="搜索机型">
+      <select id="devBrand" aria-label="品牌"><option value="">品牌…</option></select>
+      <select id="devModel" aria-label="机型"><option value="">先选品牌</option></select>
+      <select id="devPlatformSel" aria-label="平台"><option value="">平台（可选）</option></select>
+      <button id="devApply">应用</button>
+      <button class="ghost" id="devClear">恢复 ABI</button>
+    </div>
+    <div id="devMsg" class="msg"></div>
+  </div>
+
+  <div class="panel" id="egressPanel">
+    <h2>网络出口 <span class="hint" style="font-weight:400">提交走哪条线路</span></h2>
+    <div class="kv"><span>当前出口</span><b id="egIp">…</b></div>
+    <div class="kv"><span>代理</span><b id="egProxy" class="hint">未设置（直连）</b></div>
+    <div class="runform" style="margin-top:8px">
+      <input id="egInput" placeholder="http://host:port（留空=直连）" aria-label="代理地址">
+      <button id="egSave">保存</button>
+      <button class="ghost" id="egProbe">重新探测</button>
+    </div>
+    <div id="egMsg" class="msg"></div>
+  </div>
+  </div>
+
+  <div class="panel" id="semPanel">
+    <h2>记分跑 · 学期进度</h2>
+    <div id="semOut" class="planout"><div class="hint">点顶部「查学期」加载</div></div>
+  </div>
+
+  <div class="panel" id="runPanel">
+    <h2>刷跑</h2>
+    <div class="runform">
+      <label>跑法<select id="rRunMode">
+        <option value="1">记分跑（校园跑）</option>
+        <option value="4">户外跑</option>
+      </select></label>
+      <label>路线<select id="rMode">
+        <option value="free">自动规划（算法生成）</option>
+        <option value="draw">手绘轨迹（自己画）</option>
+        <option value="stadium">操场绕圈（算法生成）</option>
+      </select></label>
+      <label id="laneWrap" style="display:none">道次<select id="rLane">
+        <option>1</option><option>2</option><option>3</option><option>4</option>
+        <option>5</option><option>6</option><option>7</option><option>8</option>
+      </select></label>
+      <label>距离 km<input id="rDist" type="number" value="2.0" step="0.1" min="0.5" max="21"></label>
+      <label title="留空=默认 42±21m。填了就按中点+半宽生成，整条轨迹落在区间内。不同校区海拔差很多，写死会露馅">海拔 m
+        <span style="display:inline-flex;gap:4px;align-items:center">
+          <input id="rAltMin" type="number" placeholder="最低" step="1" min="-500" max="9000" style="width:64px">
+          ~
+          <input id="rAltMax" type="number" placeholder="最高" step="1" min="-500" max="9000" style="width:64px">
+        </span>
+      </label>
+      <label>配速 分/km
+        <span style="display:inline-flex;gap:4px;align-items:center">
+          <input id="rPaceMin" type="number" value="5.5" step="0.1" min="2" max="12" style="width:64px">
+          ~
+          <input id="rPaceMax" type="number" value="6.6" step="0.1" min="2" max="12" style="width:64px">
+        </span>
+      </label>
+      <label class="chkline" title="按上面的配速区间随机取一个配速，乘距离得到时长；每次提交都重新随机">
+        <input id="rAutoDur" type="checkbox" checked> 时长自动
+        <span id="durHint" class="hint"></span>
+      </label>
+
+      <label class="chkline" title="不拉 OSM 路网、不拉高德瓦片，直接按几何连打卡点。网络连不上这两个源时最快，代价是轨迹不沿真实道路">
+        <input id="rNoRoads" type="checkbox"> 纯几何（跳过路网）</label>
+      <label>时长 分<input id="rDur" type="number" value="12" step="0.1" min="3" max="180" readonly></label>
+      <label>步数<input id="rSteps" type="number" step="10" min="100" placeholder="自动"
+        title="留空则按配速区间推算步数，一般不用填"></label>
+      <label>何时跑<select id="rWhen">
+        <option value="now">现在</option>
+        <option value="at">指定时刻</option>
+        <option value="ago">N 分钟前</option>
+        <option value="rand">当天随机</option>
+      </select></label>
+      <label id="wrapAt" style="display:none">时刻<input id="rAt" type="time" value="07:30"></label>
+      <label id="wrapDays" style="display:none">几天前<input id="rDays" type="number" min="0" max="3" value="0" style="width:70px"></label>
+      <label id="wrapAgo" style="display:none">分钟前<input id="rAgo" type="number" min="1" max="4320" value="60" style="width:80px"></label>
+      <div id="drawWrap" style="display:none;flex-basis:100%">
+        <div class="hint" style="margin:6px 0">
+          在地图上按住拖动画出路线，起点就是开跑位置。画完点“用这条轨迹”。
+        </div>
+        <button id="drawStart" class="ghost">开始绘制</button>
+        <button id="drawUndo" class="ghost">撤销上一笔</button>
+        <button id="drawErase" class="ghost" title="按住划过要删掉的那一段，只擦局部，不用重画整圈">橡皮</button>
+        <button id="drawClear" class="ghost">清空</button>
+        <button id="drawUse">用这条轨迹</button>
+        <span id="drawInfo" class="hint" style="margin-left:8px"></span>
+      </div>
+      <div id="locWrap" style="flex-basis:100%;display:flex;gap:8px;align-items:flex-end;
+           flex-wrap:wrap;margin-top:8px;padding-top:8px;border-top:1px solid var(--line-soft)">
+        <label style="margin:0">纬度<input id="llLat" class="coord-input" type="number" step="0.000001" placeholder="留空=用围栏" aria-label="纬度"></label>
+        <label style="margin:0">经度<input id="llLng" class="coord-input" type="number" step="0.000001" placeholder="留空=用围栏" aria-label="经度"></label>
+        <label style="margin:0">坐标来自<select id="llCoord">
+          <option value="gcj02">高德 / 腾讯</option>
+          <option value="bd09">百度</option>
+          <option value="wgs84">GPS 原始</option>
+        </select></label>
+        <button id="llGo" class="primary" type="button">定位</button>
+        <button id="llPick" class="ghost" type="button">在地图上点选</button>
+        <button id="llFetch" class="ghost" type="button"
+                title="只拉围栏和必到点，不生成轨迹">查围栏/点位</button>
+        <button id="netcheckBtn" class="ghost" type="button"
+                title="分别探测 Overpass 与高德瓦片，生成慢时用它定位是哪条链路">网络自检</button>
+        <label style="margin:0" title="账号下发了多个校区/场地时在这里切换；选中会把定位锚点挪到该围栏中心">
+          <select id="fenceSel" class="coord-input" style="min-width:130px" aria-label="校区/场地">
+            <option value="">校区/场地（先查一次）</option>
+          </select></label>
+        <button id="llClear" class="ghost" type="button">清空</button>
+        <span id="llInfo" class="hint"></span>
+        <pre id="ncOut" class="mono" style="display:none;flex-basis:100%;margin:6px 0 0;font-size:11px;line-height:1.6;white-space:pre-wrap;color:var(--dim)"></pre>
+      </div>
+
+      <div id="endWrap" style="flex-basis:100%;display:flex;gap:8px;align-items:flex-end;
+           flex-wrap:wrap;margin-top:8px;padding-top:8px;border-top:1px solid var(--line-soft)">
+        <label style="margin:0">终点纬度<input id="endLat" class="coord-input" type="number" step="0.000001"
+               placeholder="留空=绕回起点" aria-label="终点纬度"></label>
+        <label style="margin:0">终点经度<input id="endLng" class="coord-input" type="number" step="0.000001"
+               placeholder="留空=绕回起点" aria-label="终点经度"></label>
+        <button class="ghost" id="endPick">在地图上点终点</button>
+        <button class="ghost" id="endClear">清除终点</button>
+        <span id="endInfo" class="hint">留空时跑完绕回起点；填了就收在终点</span>
+      </div>
+      <div id="blockWrap" style="flex-basis:100%;margin-top:6px">
+        <button id="blockStart" class="ghost">标注禁区（画楼）</button>
+        <button id="blockUndo" class="ghost">撤销上一块</button>
+        <button id="blockSave" class="ghost">保存禁区</button>
+        <span id="blockInfo" class="hint"></span>
+      </div>
+      <div class="actionbar">
+        <button id="planBtn" type="button">生成轨迹</button>
+        <button id="runBtn" class="danger" type="button">真的跑（提交）</button>
+      </div>
+    </div>
+    <div id="planOut" class="planout"></div>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <h2>跑步记录</h2>
+      <div id="list"><div class="empty"><span class="spin"></span> 加载记录…</div></div>
+    </div>
+    <div>
+      <div class="panel">
+        <h2>轨迹地图</h2>
+        <div class="trackbar">
+          <label><input type="checkbox" id="showTrack"> 预览轨迹</label>
+          <label><input type="checkbox" id="showRec" checked> 记录轨迹</label>
+        </div>
+        <div id="map"></div>
+        <div id="detail" class="hint">点一条记录看轨迹</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<!-- 本地脚本按拆分文件顺序引入；顺序即原单文件的分节顺序，顶层
+     const/let 不提升，后面的文件直接引用 core.js 的绑定，不能乱。 -->
+<script src="/js/core.js"></script>
+<script src="/js/generate.js"></script>
+<script src="/js/map.js"></script>
+<script src="/js/draw.js"></script>
+<script src="/js/records.js"></script>
+<script src="/js/boot.js"></script>
+</body>
+</html>

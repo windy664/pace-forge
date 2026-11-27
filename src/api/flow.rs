@@ -25,6 +25,7 @@ use super::fence::{self, FencePick};
 use super::obs;
 use super::points::{self, PointsContext};
 use super::policy::{self, PolicyInfo};
+use crate::error::{Error, ErrorKind};
 use crate::track::{
     Check, Checkpoint, KinParams, PlanRequest, PlanResult, Report, SimParams, TrackPoint,
     inspect_at, plan, simulate,
@@ -117,15 +118,6 @@ pub struct RunParams {
 /// 跑道，在不是操场的地方画椭圆（用户看到的「我选了自由路线，怎么绕操场」）。
 fn should_try_stadium(run_mode: i64, prefer_stadium: bool) -> bool {
     run_mode == 1 && prefer_stadium
-}
-
-/// CLI 的「是否操场」开关（issue #37）。默认 `0`（走路网/按序串点），
-/// 显式 `PACE_PREFER_STADIUM=1/true/yes` 才试操场。web 走 mode=stadium，不用它。
-pub fn prefer_stadium_env() -> bool {
-    matches!(
-        std::env::var("PACE_PREFER_STADIUM").ok().as_deref(),
-        Some("1") | Some("true") | Some("yes")
-    )
 }
 
 fn try_stadium_track(
@@ -596,42 +588,51 @@ impl RunParams {
     /// 之前三个入口各写一套：Web 拦到 300 分钟，CLI 什么都不拦，
     /// `MAX_RUN_TIME`（7200 秒 = 120 分钟）这个常量定义了却从没被引用。
     /// 结果 `run 2 200` 能一路走到提交，必然被服务端驳回，还累计风控次数。
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), Error> {
         if !self.distance_m.is_finite() || self.distance_m <= 0.0 {
-            return Err(format!("距离必须是正数，收到 {}", self.distance_m));
+            return Err(ErrorKind::client(format!(
+                "距离必须是正数，收到 {}",
+                self.distance_m
+            )));
         }
         if self.distance_m > 42_000.0 {
-            return Err(format!(
+            return Err(ErrorKind::client(format!(
                 "距离 {} m 超过上限 42000 m（42 公里）",
                 self.distance_m
-            ));
+            )));
         }
         if self.duration_sec <= 0 {
-            return Err(format!("时长必须为正，收到 {} 秒", self.duration_sec));
+            return Err(ErrorKind::client(format!(
+                "时长必须为正，收到 {} 秒",
+                self.duration_sec
+            )));
         }
         if self.duration_sec > super::submit::MAX_RUN_TIME {
-            return Err(format!(
+            return Err(ErrorKind::client(format!(
                 "时长 {} 秒超过上限 {} 秒（{} 分钟）——超过这个值服务端必然驳回",
                 self.duration_sec,
                 super::submit::MAX_RUN_TIME,
                 super::submit::MAX_RUN_TIME / 60
-            ));
+            )));
         }
         if let Some(st) = self.steps
             && st < 0
         {
-            return Err(format!("步数不能为负，收到 {st}"));
+            return Err(ErrorKind::client(format!("步数不能为负，收到 {st}")));
         }
         if !(-90.0..=90.0).contains(&self.center_lat)
             || !(-180.0..=180.0).contains(&self.center_lng)
         {
-            return Err(format!(
+            return Err(ErrorKind::client(format!(
                 "定位锚点越界: ({}, {})",
                 self.center_lat, self.center_lng
-            ));
+            )));
         }
         if self.sample_step_m <= 0.0 || self.sample_step_m > 100.0 {
-            return Err(format!("几何采样间距不合理: {} m", self.sample_step_m));
+            return Err(ErrorKind::client(format!(
+                "几何采样间距不合理: {} m",
+                self.sample_step_m
+            )));
         }
         // 上报节奏校验。
         //
@@ -645,35 +646,35 @@ impl RunParams {
         //   （硬拦在 15 秒，容忍度留给压测；更严的「必须贴着 5 秒」在
         //   `preflight::SAMPLE_RATE` 里，那里看的是**生成结果**的分布。）
         if !self.sample_interval_sec.is_finite() || self.sample_interval_sec < 1.0 {
-            return Err(format!(
+            return Err(ErrorKind::client(format!(
                 "上报采样间隔 {}s 不合理：报文时间精度是秒，小于 1 秒会画出 0 时长段",
                 self.sample_interval_sec
-            ));
+            )));
         }
         if self.sample_interval_sec > 15.0 {
-            return Err(format!(
+            return Err(ErrorKind::client(format!(
                 "上报采样间隔 {}s 超过真机节奏（{:.2}s）的三倍，点数会明显偏少",
                 self.sample_interval_sec,
                 crate::track::REAL_MEAN_INTERVAL_SEC
-            ));
+            )));
         }
         // 点数下界：一条轨迹至少要有两个点，且起步额外点需要时长够长。
         let est = crate::track::sample_times(self.duration_sec, 0, self.sample_interval_sec);
         if est.len() < 4 {
-            return Err(format!(
+            return Err(ErrorKind::client(format!(
                 "时长 {}s / 间隔 {}s 只能采出 {} 个点，至少要 4 个",
                 self.duration_sec,
                 self.sample_interval_sec,
                 est.len()
-            ));
+            )));
         }
         if est.len() > 40_000 {
-            return Err(format!(
+            return Err(ErrorKind::client(format!(
                 "时长 {}s / 间隔 {}s 会采出 {} 个点，报文过大",
                 self.duration_sec,
                 self.sample_interval_sec,
                 est.len()
-            ));
+            )));
         }
         Ok(())
     }
@@ -721,13 +722,21 @@ pub type Log = dyn FnMut(&str);
 /// 流程产物。
 #[derive(Debug, Clone)]
 pub struct RunOutcome {
+    /// 学校规则。
     pub policy: PolicyInfo,
+    /// 选中的围栏和兜底标记。
     pub fence: Option<FencePick>,
+    /// 打卡点上下文。
     pub points: PointsContext,
+    /// 轨迹点数。
     pub track_points: usize,
+    /// 轨迹实际长度（米）。
     pub actual_length_m: f64,
+    /// 总步数。
     pub total_steps: i32,
+    /// 平均步频（步/分钟）。
     pub avg_cadence: f64,
+    /// 自检报告。
     pub report: Report,
     /// 轨迹点（含时间戳），提交与明细上传都要用。
     pub track: Vec<crate::track::TrackPoint>,
@@ -737,9 +746,11 @@ pub struct RunOutcome {
     pub start_ms: i64,
     /// 几何实测里程（可能和目标有小偏差）。
     pub real_length_m: i64,
+    /// OBS 上传用的对象 key 列表。
     pub obs_keys: Vec<String>,
     /// 是否已提交。
     pub submitted: bool,
+    /// 服务端记录 id，提交成功后才有。
     pub record_id: Option<i64>,
     /// 本次报文用的点位数组（28 字段/点，与 `allLocJson` 同构）。
     ///
@@ -779,91 +790,16 @@ fn rerun_start_ms(local_t: i64, skew: Option<i64>) -> i64 {
     local_t + skew.unwrap_or(0)
 }
 
-/// 只做到自检为止（不发任何写请求）。
+/// ① 拉取策略串（记分跑在时段外会 11016，允许按配置兜底）。
 ///
-/// 用来在提交前确认数据没问题——大部分坑在这一步就能发现。
-pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutcome, String> {
-    p.validate()?;
-    // 校时：之后所有时间戳都必须落在服务器时间轴上。
-    // 「开始时间 + 时长 ≤ 服务器现在」是服务端硬判据，本机时钟偏十几分钟
-    // 就直接驳回，而本地自检用同一个时钟，永远发现不了这个偏差。
-    // 阶段计时：每一步都报耗时，卡住时日志里能直接看出卡在哪一段。
-    let dry_t0 = std::time::Instant::now();
-    let mut stage_t = dry_t0;
-
-    let (server_now, skew) = super::gmttime::server_now_ms(client);
-    match skew {
-        Some(off) if off.abs() >= 1000 => log(&format!(
-            "√ [clock] 已校时：服务器比本机{}{}ms",
-            if off > 0 { "快" } else { "慢" },
-            off.abs()
-        )),
-        Some(_) => log("√ [clock] 已校时：与本机一致"),
-        None => log("· [clock] 校时失败，按本机时钟继续"),
-    }
-    let start_ms = match p.start_at_ms {
-        // 补跑：时间是外部算好的，但**必须搬到服务器时间轴上**再发。
-        //
-        // `start_time` 模块用的是本机时钟（它没有服务器时间），算出来的 `t`
-        // 带本机误差。校时拿到的 `skew` 原来只写进日志就丢了——本机快 10 分钟
-        // 时，补跑记录会原样落到服务器未来轴，同样被「开始 + 时长 ≤ 现在」
-        // 驳回。`skew = 服务器 - 本机`，所以是加。
-        Some(t) => {
-            use rand::Rng;
-            let mut r = rand::rng();
-            rerun_start_ms(t, skew) + r.random_range(0..4_000i64)
-        }
-        // 「现在跑」= 补一条**刚跑完**的记录，不是「从现在开始跑」。
-        //
-        // 早先这里取 `server_now + 0~5s`，而 `stop = start + duration*1000`，
-        // 于是整条记录的时间窗必然落在服务器未来——服务端按「开始 + 时长 ≤
-        // 服务器当前时间」判据会驳回，且失败计入错误次数。现在把结束时刻压到
-        // 服务器现在之前的 5~9 秒（留余量吸收往返延迟与毫秒抖动），
-        // 起跑时刻随之倒推一整个时长。
-        None => {
-            use rand::Rng;
-            let mut r = rand::rng();
-            // 5~9 秒余量：吸收提交往返延迟与服务端毫秒级抖动
-            start_for_immediate_run(
-                server_now,
-                p.duration_sec,
-                5_000 + r.random_range(0..4_000i64),
-            )
-        }
-    };
-
-    // ⓿ 学期进度：记分跑要先知道还差多少
-    if p.run_mode == 1 {
-        match super::semester::fetch_summary(client) {
-            Ok(sm) => log(&format!("√ [semester] {}", sm.summary())),
-            Err(e) => log(&format!("· [semester] 查询失败（不影响流程）: {e}")),
-        }
-        match super::semester::fetch_goal(client, p.run_mode) {
-            Ok(g) if g.target_dis > 0.0 => {
-                let left = g.remaining_dis(0.0) / 1000.0;
-                log(&format!(
-                    "√ [goal] 学期目标 {:.1}km / {} 次{}",
-                    left,
-                    g.target_count,
-                    if g.days_left(server_now) >= 0 {
-                        format!("，还剩 {} 天", g.days_left(server_now))
-                    } else {
-                        String::new()
-                    }
-                ));
-            }
-            Ok(_) => {}
-            Err(e) => log(&format!("· [goal] 查询失败（不影响流程）: {e}")),
-        }
-    }
-
-    // ① policy
+/// 提出来是为了让 [`dry_run`] 只剩「哪一步、什么顺序」，降级规则留在这里。
+fn stage_policy(client: &Client, p: &RunParams, log: &mut Log) -> Result<PolicyInfo, Error> {
     log(&format!("[policy] 拉取策略 runMode={}…", p.run_mode));
     // 记分跑在时段外会直接 11016，连策略串都拿不到。但提交报文只要
     // policy 这个字符串（实测恒为 "0"），timestamp 不进签名，点位又走
     // 独立的 /api/points，所以拿不到策略不等于不能提交。
-    // PACE_STRICT_POLICY=1 可以关掉兜底，保留原来的硬失败行为。
-    let strict = std::env::var("PACE_STRICT_POLICY").ok().as_deref() == Some("1");
+    // 配置 run.strict_policy（PACE_STRICT_POLICY=1）可以关掉兜底，保留原来的硬失败行为。
+    let strict = crate::config::global().run.strict_policy;
     let pol = match policy::fetch_policy_for(client, p.run_mode) {
         Ok(v) => {
             log(&format!(
@@ -884,14 +820,11 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         }
         Err(e) => return Err(e),
     };
+    Ok(pol)
+}
 
-    log(&format!(
-        "[耗时] 校时+策略 {:.1}s",
-        stage_t.elapsed().as_secs_f64()
-    ));
-    stage_t = std::time::Instant::now();
-
-    // ② fence
+/// ② 拉围栏并选锚点所在的圈；计分跑拿不到围栏就是硬失败（issue #8）。
+fn stage_fence(client: &Client, p: &RunParams, log: &mut Log) -> Result<Option<FencePick>, Error> {
     // 自由跑 / 户外跑：runMode=2 服务端本来就不下发围栏（geoFence=null），
     // 跳过拉取，直接走「无围栏」支路（轨迹绕锚点自由生成）。
     let fences = if p.free_run {
@@ -936,24 +869,26 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
             // 还看不到哪一步降级了（issue #8）。这里只拦「拿不到」，学校确实
             // 没配围栏是 `Ok(空)`，仍按原行为继续。
             if p.run_mode == 1 {
-                return Err(format!(
+                return Err(ErrorKind::client(format!(
                     "计分跑必须拿到官方围栏，但接口失败：{e}\n                     这不是重试能绕过的问题——先确认登录态和校区选择，再重新生成"
-                ));
+                )));
             }
             log(&format!("⚠ [fence] 接口失败，按自由跑继续: {e}"));
             None
         }
     };
+    Ok(pick)
+}
 
-    log(&format!(
-        "[耗时] 围栏 {:.1}s",
-        stage_t.elapsed().as_secs_f64()
-    ));
-    stage_t = std::time::Instant::now();
-
-    // ③ points
+/// ③ 拉打卡点：接口空数组时退回围栏下发的必经点，失败则无点位继续。
+fn stage_points(
+    client: &Client,
+    p: &RunParams,
+    pick: Option<&FencePick>,
+    log: &mut Log,
+) -> PointsContext {
     // 自由跑 / 户外跑：没有打卡点，跳过拉取（neko 的自由跑同样不拉点位）。
-    let pt = match if p.free_run {
+    match if p.free_run {
         log("[points] 自由跑：跳过打卡点拉取，轨迹将绕锚点自由生成");
         Ok(PointsContext::default())
     } else {
@@ -1023,15 +958,22 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
             ));
             PointsContext::default()
         }
-    };
+    }
+}
 
-    log(&format!(
-        "[耗时] 打卡点 {:.1}s",
-        stage_t.elapsed().as_secs_f64()
-    ));
-    stage_t = std::time::Instant::now();
-
-    // ④ 规划
+/// ④ 规划：手绘 > 操场 > 围栏路线/自由规划，产出 `track` 与支路标记。
+///
+/// 这一段原来占 `dry_run` 500 行，分支判断（终点优先于操场、操场点位顺序闸、
+/// 手绘不缩放）都留在这里；`dry_run` 只拿到结果，不再看过程。
+fn plan_stage(
+    p: &RunParams,
+    pt: &PointsContext,
+    pick: Option<&FencePick>,
+    start_ms: i64,
+    log: &mut Log,
+) -> Result<TrackStage, Error> {
+    // 子阶段计时（手绘/操场），与 `dry_run` 的整段计时互不影响。
+    let mut stage_t = std::time::Instant::now();
     let cps: Vec<Checkpoint> = pt
         .coords
         .iter()
@@ -1347,7 +1289,6 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
             "[耗时] 拉路网 {:.1}s",
             stage_t.elapsed().as_secs_f64()
         ));
-        stage_t = std::time::Instant::now();
 
         let route = if let Some(r) = on_roads {
             r
@@ -1550,13 +1491,42 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         p.distance_m,
         (track.actual_length_m - p.distance_m).abs() / p.distance_m * 100.0
     ));
+    Ok(TrackStage {
+        cps,
+        blockers_used,
+        track,
+        track_mode,
+        stadium_fallback,
+    })
+}
 
-    log(&format!(
-        "[耗时] 规划 {:.1}s",
-        stage_t.elapsed().as_secs_f64()
-    ));
-    stage_t = std::time::Instant::now();
+/// [`plan_stage`] 的产出：后续 ⑤ 采样、⑥ 仿真、⑦ 自检都要用。
+struct TrackStage {
+    /// 打卡点（含 GCJ-02 坐标与 `P{i}` 名字）。
+    cps: Vec<Checkpoint>,
+    /// 本次避让用的障碍轮廓；只有围栏支路会填。
+    blockers_used: Vec<Vec<(f64, f64)>>,
+    /// 规划出来的几何。
+    track: crate::track::PlanResult,
+    /// `"draw"` / `"stadium"` / `"route"`。
+    track_mode: &'static str,
+    /// 请求了操场但回退到路线规划。
+    stadium_fallback: bool,
+}
 
+/// ⑤ 上报采样：等时间 5 秒一格，几何仍取密采样折线。
+///
+/// 采样率、压平、吸附、拐角补位、间隔上限这些都在这里；`dry_run` 只拿
+/// `track_points` / `real_len` / `timed` 三样东西。
+fn sample_stage(
+    p: &RunParams,
+    pol: &PolicyInfo,
+    track: &crate::track::PlanResult,
+    cps: &[Checkpoint],
+    blockers_used: &[Vec<(f64, f64)>],
+    start_ms: i64,
+    log: &mut Log,
+) -> Result<SampleStage, Error> {
     // ⑤ 上报采样：**等时间** 5 秒（真机节奏），几何仍走密采样。
     //
     // 这一步换掉的是「按距离采样 + 由几何反推时间」的老做法。
@@ -1608,11 +1578,11 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         &KinParams::default(),
         v_floor,
         v_ceil,
-        &blockers_used,
+        blockers_used,
         &cp_pairs,
     );
     if track_points.len() < 2 {
-        return Err("上报采样失败：时间轴或几何为空".into());
+        return Err(ErrorKind::client("上报采样失败：时间轴或几何为空".into()));
     }
     log(&format!(
         "[sample] 等时间采样 {:.1}s → {} 点（几何折线 {} 点 / 步长 {:.1}m）",
@@ -1770,7 +1740,7 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
     // 最小位移推出，**点数不变**，所以下面按索引对时间戳的映射依然成立。
     if !blockers_used.is_empty() {
         let mut flat: Vec<(f64, f64)> = track_points.iter().map(|q| (q.lat, q.lon)).collect();
-        let moved = crate::track::fence_route::nudge_outside(&mut flat, &blockers_used, 2.0);
+        let moved = crate::track::fence_route::nudge_outside(&mut flat, blockers_used, 2.0);
         if moved > 0 {
             for (tp, (la, ln)) in track_points.iter_mut().zip(flat.iter()) {
                 tp.lat = *la;
@@ -1825,6 +1795,377 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         cad.dt_within_5s * 100.0,
         real_len as f64 / p.duration_sec as f64
     ));
+    Ok(SampleStage {
+        track_points,
+        real_len,
+        timed,
+    })
+}
+
+/// [`sample_stage`] 的产出。
+struct SampleStage {
+    /// 上报点（按 5 秒时间网格取的采样点）。
+    track_points: Vec<crate::track::TrackPoint>,
+    /// 吸附/压平后重算的实测里程（米），报文的 `totalDis` 与它同源。
+    real_len: i64,
+    /// 采样点的 `(lat, lng, time_ms)`，给仿真用。
+    timed: Vec<(f64, f64, i64)>,
+}
+
+/// 只做到自检为止（不发任何写请求）。
+///
+/// 用来在提交前确认数据没问题——大部分坑在这一步就能发现。
+/// ⑦ 自检：把报文反解的视图交给 preflight，拦在本地。
+fn inspect_probe(
+    view: &super::submit::VerifyView,
+    pol: &PolicyInfo,
+    cp_tuples: &[(f64, f64, String)],
+    sim_params: &SimParams,
+    sample_interval_sec: f64,
+    server_now: i64,
+    log: &mut Log,
+) -> Result<crate::track::preflight::Report, Error> {
+    let view_sim = view.as_sim();
+    let check = Check {
+        points: &view.points,
+        sim: &view_sim,
+        params: sim_params,
+        checkpoints: cp_tuples,
+        total_distance_m: view.total_distance_m as i64,
+        total_time_sec: view.total_time_sec,
+        total_steps: view.total_steps,
+        start_time_ms: view.start_time_ms,
+        stop_time_ms: view.stop_time_ms,
+        pace_range: pol.pace_range,
+        step_range: pol.step_range,
+        expected_interval_sec: Some(sample_interval_sec),
+    };
+    let report = inspect_at(&check, Some(server_now));
+    if report.blocked() {
+        for line in report.lines() {
+            log(&format!("  {line}"));
+        }
+        return Err(ErrorKind::client(format!(
+            "自检未通过：{}",
+            report.summary()
+        )));
+    }
+    log(&format!("√ [preflight] {}", report.summary()));
+    for line in report.lines() {
+        log(&format!("  {line}"));
+    }
+
+    Ok(report)
+}
+
+/// 自检点位数组的三道校验：必到点齐、isPass 全 true、type=2 数量对得上。
+fn audit_points(
+    sub: &super::submit::Submission,
+    fixed: &[super::submit::FixedPoint],
+    log: &mut Log,
+) -> Result<(), Error> {
+    // 自检与上传必须共用同一份点位。
+    //
+    // 早先这里是数 `type=2` 打卡标记的个数，用来兜「`fixed` 传空」——
+    // 后来口径分了流（见 submit::PointTypeScheme）：带必到点的跑法才撒
+    // `type=2`，没有必到点的跑法不发。数标记就不再可靠，改成直接数必到点
+    // 数组，不依赖采样点 `type` 的口径。
+    let fp_items: Vec<Value> = sub
+        .save_record
+        .get("fivePointJson")
+        .and_then(|v| v.as_str())
+        .and_then(|x| serde_json::from_str::<Value>(x).ok())
+        .and_then(|v| v.get("fivePointJson").cloned())
+        .and_then(|v| {
+            v.as_str()
+                .and_then(|x| serde_json::from_str::<Vec<Value>>(x).ok())
+        })
+        .unwrap_or_default();
+    let n_fixed = fp_items.len();
+
+    // isPass 必须全 true —— App 详情页就按它画绿点。
+    //
+    // 少一个就少画一个绿点（4 绿 1 橙）。成因通常是：起点(`type=7`) 或起步
+    // 窗口的灰点(`type=-1`) 把某个必到点 10m 命中圈里唯一的采样点占掉了，
+    // `type=2` 还能靠 Relaxed 兜到圈外，但 `isPass` 用的是严格 10m，于是 false。
+    //
+    // 这种记录发出去等于白跑一次（App 里那个点是橙的），所以拦在本地。
+    let not_passed: Vec<String> = fp_items
+        .iter()
+        .filter(|p| p.get("isPass").and_then(|v| v.as_bool()) == Some(false))
+        .map(|p| {
+            p.get("pointName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(未命名)")
+                .to_string()
+        })
+        .collect();
+    if !not_passed.is_empty() {
+        return Err(ErrorKind::client(format!(
+            "有 {} 个必到点是 isPass=false：{}。\n    App 详情页会显示成橙点，这次打卡等于没算。\n    成因通常是起点或起步窗口的采样点占掉了该点位 10m 内唯一的采样点。\n    处理：把「纬度/经度」锚点挪到离这些点位 20m 以外再跑，或者换一个场地。",
+            not_passed.len(),
+            not_passed.join("、")
+        )));
+    }
+
+    // type=2 的数量必须等于必到点数。
+    //
+    // `isPass` 管成绩（服务端判「经过没有」），`type=2` 管**显示**：App 详情页
+    // 按 type=2 的点位画绿点，少一个就少画一个（issue #11：起点压在打卡点上时
+    // 5 个点只标出 4 个）。两者都得齐，缺 display 那层用户会以为没跑成。
+    let marked = sub
+        .points
+        .iter()
+        .filter(|p| p.get("type").and_then(|v| v.as_i64()) == Some(2))
+        .count();
+    if !fixed.is_empty() && marked < fixed.len() {
+        // **只警告，不拦**。
+        //
+        // 这是显示层问题：服务端判 `complete=true`、成绩照算，只是 App 详情页
+        // 少画一个绿点。拦下来等于用户跑不了——代价比少画一个点大得多。
+        // 拦过一版，实测刘的号也被挡住（他的点位批次同样会命中），说明这个
+        // 条件在某些围栏形状下是常态，不适合当门槛。
+        eprintln!(
+            "! [points] 必到点 {} 个，报文里只有 {marked} 个 type=2 标记：App 详情页会少画 {} 个绿点（成绩不受影响）",
+            fixed.len(),
+            fixed.len().saturating_sub(marked)
+        );
+    }
+    if !fixed.is_empty() && n_fixed != fixed.len() {
+        return Err(ErrorKind::client(format!(
+            "自检点位里必到点数量对不上（报文 {n_fixed} 个，应有 {} 个）：probe 的 fixed 传空了？",
+            fixed.len()
+        )));
+    }
+    log(&format!(
+        "√ [points] 自检与上传共用同一份点位：{} 点 / {} 个必到点",
+        sub.points.len(),
+        n_fixed
+    ));
+
+    Ok(())
+}
+
+/// 打印每个点位两套坐标系下的最近距离与首次经过下标，返回首次经过序列。
+fn log_point_distances(
+    pt: &PointsContext,
+    view: &super::submit::VerifyView,
+    log: &mut Log,
+) -> Vec<(usize, i64, String)> {
+    // 服务端「经过点位」到底比哪套坐标？BD-09 的 lat/lon 与 GCJ-02 的
+    // glat/glon 差 ~850m，选错一套整条记录的点位项就全是 False。
+    let mut order_seen: Vec<(usize, i64, String)> = Vec::new();
+    for (i, raw) in pt.points.iter().enumerate() {
+        let name = raw.get("pointName").and_then(|v| v.as_str()).unwrap_or("");
+        let bd = (
+            raw.get("lat").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            raw.get("lon").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        );
+        let gcj = (
+            raw.get("glat").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            raw.get("glon").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        );
+        let d_bd = view
+            .points
+            .iter()
+            .map(|p| crate::track::geo::distance((p.lat, p.lon), bd))
+            .fold(f64::MAX, f64::min);
+        let d_gcj = view
+            .points
+            .iter()
+            .map(|p| {
+                let (a, o) = crate::api::coord::bd09_to_gcj02(p.lat, p.lon);
+                crate::track::geo::distance((a, o), gcj)
+            })
+            .fold(f64::MAX, f64::min);
+        // 首次经过索引：服务端「按顺序通过所有点位」看的就是这个。
+        // 距离 0.1m 只说明穿过了，顺序错了一样判 False。
+        let first_bd = view
+            .points
+            .iter()
+            .position(|p| crate::track::geo::distance((p.lat, p.lon), bd) < 10.0)
+            .map(|x| x as i64)
+            .unwrap_or(-1);
+        log(&format!(
+            "[point-dist] #{i} {name}: BD-09 {d_bd:.1}m / GCJ-02 {d_gcj:.1}m / 首次经过 idx={first_bd}"
+        ));
+        // 记录每个点位"首次经过"的索引，下面统一检查顺序
+        if first_bd >= 0 {
+            order_seen.push((i, first_bd, name.to_string()));
+        }
+    }
+
+    order_seen
+}
+
+/// 点位顺序自检：轨迹实际穿过点位的次序必须与点位数组同序。
+fn warn_point_order(order_seen: &[(usize, i64, String)], log: &mut Log) {
+    // 点位顺序自检。
+    //
+    // 服务端的「按顺序通过所有点位」不是看 `fixed_point_json` 里的
+    // position，而是自己从轨迹里找出每个点位被经过的位置，再检查这个
+    // 序列是否和点位数组同序。也就是说：**position 传得再对也没用，
+    // 轨迹本身必须按顺序穿过它们**。
+    //
+    // 实测踩过的坑：从 #0 到 #1 的那段路径向外扩得太远，中途擦过了 #4。
+    // 轨迹实际经过顺序变成 0,4,1,2,3,4,0，服务端直接判 false，而日志里
+    // 五个点位距离全是 0.1m、detect 满分区 100%，看起来毫无问题。
+    if order_seen.len() >= 2 {
+        let mut sorted = order_seen.to_vec();
+        sorted.sort_by_key(|x| x.1);
+        let bad: Vec<String> = sorted
+            .windows(2)
+            .filter(|w| w[1].0 < w[0].0)
+            // w[0] 是索引更小的那个，所以是它抢在了 w[1] 前面
+            .map(|w| format!("#{} {} 先于 #{} {} 被经过", w[0].0, w[0].2, w[1].0, w[1].2))
+            .collect();
+        if bad.is_empty() {
+            let seq: Vec<String> = sorted.iter().map(|x| format!("#{}@{}", x.0, x.1)).collect();
+            log(&format!("[point-order] 顺序正确：{}", seq.join(" → ")));
+        } else {
+            // `isFixed` 全发 0 之后服务端认为「本场没有必经点」，也就不再
+            // 判「按顺序通过所有点位」——那时这条日志纯属吓人。只有真的带上
+            // 必经点（PACE_FORCE_NORMAL_POINT=0）才需要它。
+            if crate::api::submit::force_normal_point() {
+                log(&format!(
+                    "[point-order] 顺序乱了（{}），但点位全部按普通点发出，服务端不判顺序——可以提交",
+                    bad.join("；")
+                ));
+            } else {
+                log(&format!(
+                    "[point-order] 顺序错误，服务端会判「按顺序通过所有点位」失败：{}",
+                    bad.join("；")
+                ));
+                log("[point-order] 重新规划或调整手绘轨迹，让轨迹只按点位次序穿过每个点");
+            }
+        }
+    }
+}
+
+/// 只做到自检为止（不发任何写请求）。
+///
+/// 用来在提交前确认数据没问题——大部分坑在这一步就能发现。
+pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutcome, Error> {
+    p.validate()?;
+    // 校时：之后所有时间戳都必须落在服务器时间轴上。
+    // 「开始时间 + 时长 ≤ 服务器现在」是服务端硬判据，本机时钟偏十几分钟
+    // 就直接驳回，而本地自检用同一个时钟，永远发现不了这个偏差。
+    // 阶段计时：每一步都报耗时，卡住时日志里能直接看出卡在哪一段。
+    let dry_t0 = std::time::Instant::now();
+    let mut stage_t = dry_t0;
+
+    let (server_now, skew) = super::gmttime::server_now_ms(client);
+    match skew {
+        Some(off) if off.abs() >= 1000 => log(&format!(
+            "√ [clock] 已校时：服务器比本机{}{}ms",
+            if off > 0 { "快" } else { "慢" },
+            off.abs()
+        )),
+        Some(_) => log("√ [clock] 已校时：与本机一致"),
+        None => log("· [clock] 校时失败，按本机时钟继续"),
+    }
+    let start_ms = match p.start_at_ms {
+        // 补跑：时间是外部算好的，但**必须搬到服务器时间轴上**再发。
+        //
+        // `start_time` 模块用的是本机时钟（它没有服务器时间），算出来的 `t`
+        // 带本机误差。校时拿到的 `skew` 原来只写进日志就丢了——本机快 10 分钟
+        // 时，补跑记录会原样落到服务器未来轴，同样被「开始 + 时长 ≤ 现在」
+        // 驳回。`skew = 服务器 - 本机`，所以是加。
+        Some(t) => {
+            use rand::Rng;
+            let mut r = rand::rng();
+            rerun_start_ms(t, skew) + r.random_range(0..4_000i64)
+        }
+        // 「现在跑」= 补一条**刚跑完**的记录，不是「从现在开始跑」。
+        //
+        // 早先这里取 `server_now + 0~5s`，而 `stop = start + duration*1000`，
+        // 于是整条记录的时间窗必然落在服务器未来——服务端按「开始 + 时长 ≤
+        // 服务器当前时间」判据会驳回，且失败计入错误次数。现在把结束时刻压到
+        // 服务器现在之前的 5~9 秒（留余量吸收往返延迟与毫秒抖动），
+        // 起跑时刻随之倒推一整个时长。
+        None => {
+            use rand::Rng;
+            let mut r = rand::rng();
+            // 5~9 秒余量：吸收提交往返延迟与服务端毫秒级抖动
+            start_for_immediate_run(
+                server_now,
+                p.duration_sec,
+                5_000 + r.random_range(0..4_000i64),
+            )
+        }
+    };
+
+    // ⓿ 学期进度：记分跑要先知道还差多少
+    if p.run_mode == 1 {
+        match super::semester::fetch_summary(client) {
+            Ok(sm) => log(&format!("√ [semester] {}", sm.summary())),
+            Err(e) => log(&format!("· [semester] 查询失败（不影响流程）: {e}")),
+        }
+        match super::semester::fetch_goal(client, p.run_mode) {
+            Ok(g) if g.target_dis > 0.0 => {
+                let left = g.remaining_dis(0.0) / 1000.0;
+                log(&format!(
+                    "√ [goal] 学期目标 {:.1}km / {} 次{}",
+                    left,
+                    g.target_count,
+                    if g.days_left(server_now) >= 0 {
+                        format!("，还剩 {} 天", g.days_left(server_now))
+                    } else {
+                        String::new()
+                    }
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => log(&format!("· [goal] 查询失败（不影响流程）: {e}")),
+        }
+    }
+
+    // ① policy
+    let pol = stage_policy(client, p, log)?;
+    log(&format!(
+        "[耗时] 校时+策略 {:.1}s",
+        stage_t.elapsed().as_secs_f64()
+    ));
+    stage_t = std::time::Instant::now();
+
+    // ② fence
+    let pick = stage_fence(client, p, log)?;
+    log(&format!(
+        "[耗时] 围栏 {:.1}s",
+        stage_t.elapsed().as_secs_f64()
+    ));
+    stage_t = std::time::Instant::now();
+
+    // ③ points
+    let pt = stage_points(client, p, pick.as_ref(), log);
+    log(&format!(
+        "[耗时] 打卡点 {:.1}s",
+        stage_t.elapsed().as_secs_f64()
+    ));
+    stage_t = std::time::Instant::now();
+
+    // ④ 规划
+    let stage = plan_stage(p, &pt, pick.as_ref(), start_ms, log)?;
+    let TrackStage {
+        cps,
+        blockers_used,
+        track,
+        track_mode,
+        stadium_fallback,
+    } = stage;
+
+    log(&format!(
+        "[耗时] 规划 {:.1}s",
+        stage_t.elapsed().as_secs_f64()
+    ));
+    stage_t = std::time::Instant::now();
+
+    // ⑤ 上报采样
+    let SampleStage {
+        track_points,
+        real_len,
+        timed,
+    } = sample_stage(p, &pol, &track, &cps, &blockers_used, start_ms, log)?;
 
     // ⑥ simulate
     let sp = SimParams {
@@ -1937,196 +2278,21 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         view.total_steps,
         view.step_buckets.len()
     ));
-    let view_sim = view.as_sim();
+    let report = inspect_probe(
+        &view,
+        &pol,
+        &cp_tuples,
+        &sp,
+        p.sample_interval_sec,
+        server_now,
+        log,
+    )?;
 
-    let check = Check {
-        points: &view.points,
-        sim: &view_sim,
-        params: &sp,
-        checkpoints: &cp_tuples,
-        total_distance_m: view.total_distance_m as i64,
-        total_time_sec: view.total_time_sec,
-        total_steps: view.total_steps,
-        start_time_ms: view.start_time_ms,
-        stop_time_ms: view.stop_time_ms,
-        pace_range: pol.pace_range,
-        step_range: pol.step_range,
-        expected_interval_sec: Some(p.sample_interval_sec),
-    };
-    let report = inspect_at(&check, Some(server_now));
-    if report.blocked() {
-        for line in report.lines() {
-            log(&format!("  {line}"));
-        }
-        return Err(format!("自检未通过：{}", report.summary()));
-    }
-    log(&format!("√ [preflight] {}", report.summary()));
-    for line in report.lines() {
-        log(&format!("  {line}"));
-    }
+    audit_points(&probe_sub, &fixed, log)?;
 
-    // 自检与上传必须共用同一份点位。
-    //
-    // 早先这里是数 `type=2` 打卡标记的个数，用来兜「`fixed` 传空」——
-    // 后来口径分了流（见 submit::PointTypeScheme）：带必到点的跑法才撒
-    // `type=2`，没有必到点的跑法不发。数标记就不再可靠，改成直接数必到点
-    // 数组，不依赖采样点 `type` 的口径。
-    let fp_items: Vec<Value> = probe_sub
-        .save_record
-        .get("fivePointJson")
-        .and_then(|v| v.as_str())
-        .and_then(|x| serde_json::from_str::<Value>(x).ok())
-        .and_then(|v| v.get("fivePointJson").cloned())
-        .and_then(|v| {
-            v.as_str()
-                .and_then(|x| serde_json::from_str::<Vec<Value>>(x).ok())
-        })
-        .unwrap_or_default();
-    let n_fixed = fp_items.len();
+    let order_seen = log_point_distances(&pt, &view, log);
 
-    // isPass 必须全 true —— App 详情页就按它画绿点。
-    //
-    // 少一个就少画一个绿点（4 绿 1 橙）。成因通常是：起点(`type=7`) 或起步
-    // 窗口的灰点(`type=-1`) 把某个必到点 10m 命中圈里唯一的采样点占掉了，
-    // `type=2` 还能靠 Relaxed 兜到圈外，但 `isPass` 用的是严格 10m，于是 false。
-    //
-    // 这种记录发出去等于白跑一次（App 里那个点是橙的），所以拦在本地。
-    let not_passed: Vec<String> = fp_items
-        .iter()
-        .filter(|p| p.get("isPass").and_then(|v| v.as_bool()) == Some(false))
-        .map(|p| {
-            p.get("pointName")
-                .and_then(|v| v.as_str())
-                .unwrap_or("(未命名)")
-                .to_string()
-        })
-        .collect();
-    if !not_passed.is_empty() {
-        return Err(format!(
-            "有 {} 个必到点是 isPass=false：{}。\n    App 详情页会显示成橙点，这次打卡等于没算。\n    成因通常是起点或起步窗口的采样点占掉了该点位 10m 内唯一的采样点。\n    处理：把「纬度/经度」锚点挪到离这些点位 20m 以外再跑，或者换一个场地。",
-            not_passed.len(),
-            not_passed.join("、")
-        ));
-    }
-
-    // type=2 的数量必须等于必到点数。
-    //
-    // `isPass` 管成绩（服务端判「经过没有」），`type=2` 管**显示**：App 详情页
-    // 按 type=2 的点位画绿点，少一个就少画一个（issue #11：起点压在打卡点上时
-    // 5 个点只标出 4 个）。两者都得齐，缺 display 那层用户会以为没跑成。
-    let marked = probe_sub
-        .points
-        .iter()
-        .filter(|p| p.get("type").and_then(|v| v.as_i64()) == Some(2))
-        .count();
-    if !fixed.is_empty() && marked < fixed.len() {
-        // **只警告，不拦**。
-        //
-        // 这是显示层问题：服务端判 `complete=true`、成绩照算，只是 App 详情页
-        // 少画一个绿点。拦下来等于用户跑不了——代价比少画一个点大得多。
-        // 拦过一版，实测刘的号也被挡住（他的点位批次同样会命中），说明这个
-        // 条件在某些围栏形状下是常态，不适合当门槛。
-        eprintln!(
-            "! [points] 必到点 {} 个，报文里只有 {marked} 个 type=2 标记：App 详情页会少画 {} 个绿点（成绩不受影响）",
-            fixed.len(),
-            fixed.len().saturating_sub(marked)
-        );
-    }
-    if !fixed.is_empty() && n_fixed != fixed.len() {
-        return Err(format!(
-            "自检点位里必到点数量对不上（报文 {n_fixed} 个，应有 {} 个）：probe 的 fixed 传空了？",
-            fixed.len()
-        ));
-    }
-    log(&format!(
-        "√ [points] 自检与上传共用同一份点位：{} 点 / {} 个必到点",
-        probe_sub.points.len(),
-        n_fixed
-    ));
-
-    // 服务端「经过点位」到底比哪套坐标？BD-09 的 lat/lon 与 GCJ-02 的
-    // glat/glon 差 ~850m，选错一套整条记录的点位项就全是 False。
-    let mut order_seen: Vec<(usize, i64, String)> = Vec::new();
-    for (i, raw) in pt.points.iter().enumerate() {
-        let name = raw.get("pointName").and_then(|v| v.as_str()).unwrap_or("");
-        let bd = (
-            raw.get("lat").and_then(|v| v.as_f64()).unwrap_or(0.0),
-            raw.get("lon").and_then(|v| v.as_f64()).unwrap_or(0.0),
-        );
-        let gcj = (
-            raw.get("glat").and_then(|v| v.as_f64()).unwrap_or(0.0),
-            raw.get("glon").and_then(|v| v.as_f64()).unwrap_or(0.0),
-        );
-        let d_bd = view
-            .points
-            .iter()
-            .map(|p| crate::track::geo::distance((p.lat, p.lon), bd))
-            .fold(f64::MAX, f64::min);
-        let d_gcj = view
-            .points
-            .iter()
-            .map(|p| {
-                let (a, o) = crate::api::coord::bd09_to_gcj02(p.lat, p.lon);
-                crate::track::geo::distance((a, o), gcj)
-            })
-            .fold(f64::MAX, f64::min);
-        // 首次经过索引：服务端「按顺序通过所有点位」看的就是这个。
-        // 距离 0.1m 只说明穿过了，顺序错了一样判 False。
-        let first_bd = view
-            .points
-            .iter()
-            .position(|p| crate::track::geo::distance((p.lat, p.lon), bd) < 10.0)
-            .map(|x| x as i64)
-            .unwrap_or(-1);
-        log(&format!(
-            "[point-dist] #{i} {name}: BD-09 {d_bd:.1}m / GCJ-02 {d_gcj:.1}m / 首次经过 idx={first_bd}"
-        ));
-        // 记录每个点位"首次经过"的索引，下面统一检查顺序
-        if first_bd >= 0 {
-            order_seen.push((i, first_bd, name.to_string()));
-        }
-    }
-
-    // 点位顺序自检。
-    //
-    // 服务端的「按顺序通过所有点位」不是看 `fixed_point_json` 里的
-    // position，而是自己从轨迹里找出每个点位被经过的位置，再检查这个
-    // 序列是否和点位数组同序。也就是说：**position 传得再对也没用，
-    // 轨迹本身必须按顺序穿过它们**。
-    //
-    // 实测踩过的坑：从 #0 到 #1 的那段路径向外扩得太远，中途擦过了 #4。
-    // 轨迹实际经过顺序变成 0,4,1,2,3,4,0，服务端直接判 false，而日志里
-    // 五个点位距离全是 0.1m、detect 满分区 100%，看起来毫无问题。
-    if order_seen.len() >= 2 {
-        let mut sorted = order_seen.clone();
-        sorted.sort_by_key(|x| x.1);
-        let bad: Vec<String> = sorted
-            .windows(2)
-            .filter(|w| w[1].0 < w[0].0)
-            // w[0] 是索引更小的那个，所以是它抢在了 w[1] 前面
-            .map(|w| format!("#{} {} 先于 #{} {} 被经过", w[0].0, w[0].2, w[1].0, w[1].2))
-            .collect();
-        if bad.is_empty() {
-            let seq: Vec<String> = sorted.iter().map(|x| format!("#{}@{}", x.0, x.1)).collect();
-            log(&format!("[point-order] 顺序正确：{}", seq.join(" → ")));
-        } else {
-            // `isFixed` 全发 0 之后服务端认为「本场没有必经点」，也就不再
-            // 判「按顺序通过所有点位」——那时这条日志纯属吓人。只有真的带上
-            // 必经点（PACE_FORCE_NORMAL_POINT=0）才需要它。
-            if crate::api::submit::force_normal_point() {
-                log(&format!(
-                    "[point-order] 顺序乱了（{}），但点位全部按普通点发出，服务端不判顺序——可以提交",
-                    bad.join("；")
-                ));
-            } else {
-                log(&format!(
-                    "[point-order] 顺序错误，服务端会判「按顺序通过所有点位」失败：{}",
-                    bad.join("；")
-                ));
-                log("[point-order] 重新规划或调整手绘轨迹，让轨迹只按点位次序穿过每个点");
-            }
-        }
-    }
+    warn_point_order(&order_seen, log);
 
     log(&format!(
         "[耗时] 采样+自检 {:.1}s · 全程 {:.1}s",
@@ -2281,33 +2447,6 @@ pub(crate) fn day_key_of(ms: i64) -> String {
     format!("{y:04}-{month:02}-{:02}", d + 1)
 }
 
-#[cfg(test)]
-mod day_key_tests {
-    use super::day_key_of;
-
-    #[test]
-    fn epoch_is_1970_01_01() {
-        assert_eq!(day_key_of(0), "1970-01-01");
-    }
-
-    #[test]
-    fn leap_day_is_handled() {
-        // 2020-02-29 12:00 UTC = 东八区 20:00
-        let ms = 1_582_977_600_000i64; // 2020-02-29T12:00:00Z
-        assert_eq!(day_key_of(ms), "2020-02-29");
-        // 2021-02-28T00:00:00Z → 东八区 08:00，仍是 28 日（非闰年没有 29 日）
-        let ms2 = 1_614_499_200_000i64;
-        assert_eq!(day_key_of(ms2), "2021-02-28");
-    }
-
-    #[test]
-    fn ignores_utc_vs_local_but_uses_plus8() {
-        // 2026-11-23T15:30:00Z = 东八区 23:30 → 仍是 23 日
-        let ms = 1_795_447_800_000i64;
-        assert_eq!(day_key_of(ms), "2026-11-23");
-    }
-}
-
 /// 本机当前时间 `HH:MM:SS`（本地时区）。
 fn local_hms() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2325,12 +2464,14 @@ fn local_hms() -> String {
     )
 }
 
+/// 完整跑一遍：取规则、选围栏、取打卡点、规划并合成轨迹，
+/// 提交前调用 `confirm`，它回 `false` 就中止（已上传的 OBS 对象保留）。
 pub fn run_full(
     client: &Client,
     p: &RunParams,
     log: &mut Log,
     confirm: &mut dyn FnMut(&RunOutcome) -> bool,
-) -> Result<RunOutcome, String> {
+) -> Result<RunOutcome, Error> {
     // 前七步与 dry_run 完全一致
     let mut out = dry_run(client, p, log)?;
 
@@ -2384,19 +2525,19 @@ pub fn run_full(
             if after > cap as f64 {
                 // 超日上限直接拦：超出部分不计入有效里程，等于白跑，而且
                 // 一条明显超量的记录更容易被风控盯上。要硬跑就显式开开关。
-                if std::env::var("PACE_IGNORE_DAILY_LIMIT").is_ok() {
+                if crate::config::global().run.ignore_daily_limit {
                     log(&format!(
-                        "! [quota] 超日上限 {}m，但已设 PACE_IGNORE_DAILY_LIMIT，继续提交",
+                        "! [quota] 超日上限 {}m，但已设 run.ignore_daily_limit，继续提交",
                         (after - cap as f64).round()
                     ));
                 } else {
-                    return Err(format!(
+                    return Err(ErrorKind::client(format!(
                         "今日已跑 {done:.0}m，再加 {:.0}m 合计 {after:.0}m，超过日上限 {cap}m。\n    \
                          超出部分不计入有效里程。把距离降到 {:.0}m 以内，\n    \
                          或者设 PACE_IGNORE_DAILY_LIMIT=1 硬跑。",
                         p.distance_m,
                         (cap as f64 - done).max(0.0)
-                    ));
+                    )));
                 }
             }
         }
@@ -2413,9 +2554,9 @@ pub fn run_full(
                     "√ [window] 当前 {now} 在有效时段 {start}–{end} 内"
                 ));
             } else {
-                return Err(format!(
+                return Err(ErrorKind::client(format!(
                     "当前 {now} 不在学校有效时段 {start}–{end} 内，服务端会回 11016（不在有效时段）。\n    换个时间再跑，别在这里白烧一次提交。"
-                ));
+                )));
             }
         }
         None => log("[window] 拿不到学校时段（不影响提交）"),
@@ -2434,13 +2575,13 @@ pub fn run_full(
     // 跑步冻结：`freezeRunTime > 现在` 就别提交，冻结期提交等于自己往名单里加条。
     {
         let freeze = out.policy.freeze_run_time;
-        let now = crate::crypto::envelope::now_ms() as i64;
+        let now = crate::crypto::envelope::now_ms();
         if freeze > now {
             let left = (freeze - now) / 1000;
-            return Err(format!(
+            return Err(ErrorKind::client(format!(
                 "账号处于跑步冻结期，还剩 {left} 秒（至 {}）：冻结期提交会被再记一次违规。\n    等解冻后再跑，或用 App 里的申诉通道。",
                 freeze / 1000
-            ));
+            )));
         }
         if freeze > 0 {
             log(&format!(
@@ -2457,10 +2598,10 @@ pub fn run_full(
         match crate::api::cheat::query(client, 1, &mut |l| log(l)) {
             Ok(rep) => match rep.status() {
                 Status::Flagged => {
-                    return Err(format!(
+                    return Err(ErrorKind::client(format!(
                         "服务端已把当前账号标记为违规（{}）：先处理，别继续提交。详见 [cheat] 那几行",
                         rep.summary()
-                    ));
+                    )));
                 }
                 Status::NoRecord => log("√ [cheat] 违规名单自查：当前账号无记录"),
                 s => log(&format!(
@@ -2473,7 +2614,10 @@ pub fn run_full(
     }
 
     if out.report.blocked() {
-        return Err(format!("自检未通过，不提交：{}", out.report.summary()));
+        return Err(ErrorKind::client(format!(
+            "自检未通过，不提交：{}",
+            out.report.summary()
+        )));
     }
     if !confirm(&out) {
         log("[flow] 已取消，未提交");
@@ -2523,7 +2667,9 @@ pub fn run_full(
             log(&format!("  · {line}"));
         }
         if rep.blocked() {
-            return Err("点位体检未通过，提交会被判异常，已中止".into());
+            return Err(ErrorKind::client(
+                "点位体检未通过，提交会被判异常，已中止".into(),
+            ));
         }
     }
 
@@ -2631,7 +2777,9 @@ pub fn run_full(
     // 结构上不可能不等（同一个 Vec 的克隆），但真出现「谁在中途改了点位」
     // 就是 A4 回归，宁可在这里停住也别把两份数据分别发出去。
     if submission.points != out.submission_points {
-        return Err("点位数组在自检与提交之间被改动过（A4 回归）".into());
+        return Err(ErrorKind::client(
+            "点位数组在自检与提交之间被改动过（A4 回归）".into(),
+        ));
     }
 
     // 7.4.01 已移除 BODY_SENSORS，报文里不许出现心率字段
@@ -2656,10 +2804,10 @@ pub fn run_full(
     // 记录判成来源可疑，所以宁可在这里拦下。
     let derived_problems = super::submit::audit_derived(&body, &submission.points);
     if !derived_problems.is_empty() {
-        return Err(format!(
+        return Err(ErrorKind::client(format!(
             "报文派生字段自检失败（未提交）：{}",
             derived_problems.join("；")
-        ));
+        )));
     }
     log("√ [selfcheck] 派生字段与点位列自洽（爬升/卡路里/功率/配速/圈）");
     // 必到点次序回显。App 详情页的「必到点位」就是按这段报文显示的：
@@ -2722,7 +2870,7 @@ pub fn run_full(
                 "  服务端有 3 天补传窗口：这条记录客户端侧已生成，先到 App 记录页\n  \
                  核对是否入账，别立刻重刷（重复提交比失败更麻烦）",
             );
-            return Err(f.message);
+            return Err(ErrorKind::protocol(f.message));
         }
     };
     out.submitted = true;
@@ -2773,7 +2921,8 @@ pub fn run_full(
         // rrid 前 4 位——前端注释的说法
         format!("run_data/{}/{rrid}.json", rrid / 1_000_000),
     ];
-    let bytes = serde_json::to_vec(&payload).map_err(|e| format!("明细序列化失败: {e}"))?;
+    let bytes = serde_json::to_vec(&payload)
+        .map_err(|e| ErrorKind::client(format!("明细序列化失败: {e}")))?;
     let (ok, errs) = obs::upload_keys(client, &keys, &bytes);
     for e in &errs {
         log(&format!("  ⚠ {e}"));
@@ -2996,7 +3145,6 @@ pub fn detail_payload(
 // OBS 明细要 10 个字段，每个都来自不同的数据源（模拟结果、账号标识、时间
 // 窗口、uuid、点位数组），拆结构体只会把这些东西再包一层而不会减少耦合，
 // 所以这里保持平铺。
-#[allow(clippy::too_many_arguments)]
 pub fn detail_payload_rrid(
     sim: &crate::track::SimResult,
     uid: &str,
@@ -3085,28 +3233,59 @@ pub fn upload_detail(
     start_ms: i64,
     uid: &str,
     log: &mut Log,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, Error> {
     let uuid = super::client::uuid_v4();
     let keys = vec![
         obs::detail_key(start_ms, &uuid),
         obs::fallback_key(uid, p.sport_type, start_ms / 1000, &uuid),
     ];
-    let bytes = serde_json::to_vec(payload).map_err(|e| format!("明细序列化失败: {e}"))?;
+    let bytes = serde_json::to_vec(payload)
+        .map_err(|e| ErrorKind::client(format!("明细序列化失败: {e}")))?;
     log(&format!("[obs] 上传明细 {} 字节…", bytes.len()));
     let (ok, errs) = obs::upload_keys(client, &keys, &bytes);
     for e in &errs {
         log(&format!("  ⚠ {e}"));
     }
     if ok == 0 {
-        return Err("OBS 全部 key 上传失败".into());
+        return Err(ErrorKind::client("OBS 全部 key 上传失败".into()));
     }
     log(&format!("√ [obs] {ok}/{} 个 key 上传成功", keys.len()));
     Ok(keys)
 }
 
 #[cfg(test)]
-mod body_pace_tests {
+mod tests {
     use super::body_pace_note;
+    use super::day_key_of;
+    use super::*;
+    use crate::api::submit::{self, FixedPoint, SubmitParams};
+    use base64::Engine;
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    #[test]
+    fn epoch_is_1970_01_01() {
+        assert_eq!(day_key_of(0), "1970-01-01");
+    }
+
+    #[test]
+    fn leap_day_is_handled() {
+        // 2020-02-29 12:00 UTC = 东八区 20:00
+        let ms = 1_582_977_600_000i64; // 2020-02-29T12:00:00Z
+        assert_eq!(day_key_of(ms), "2020-02-29");
+        // 2021-02-28T00:00:00Z → 东八区 08:00，仍是 28 日（非闰年没有 29 日）
+        let ms2 = 1_614_499_200_000i64;
+        assert_eq!(day_key_of(ms2), "2021-02-28");
+    }
+
+    #[test]
+    fn ignores_utc_vs_local_but_uses_plus8() {
+        // 2026-11-23T15:30:00Z = 东八区 23:30 → 仍是 23 日
+        let ms = 1_795_447_800_000i64;
+        assert_eq!(day_key_of(ms), "2026-11-23");
+    }
+
+    // ---- merged from former `mod body_pace_tests` ----
 
     /// 已经越界：2km/11min 的主体配速约 4'35"，快于 5'00" 下界。
     #[test]
@@ -3159,12 +3338,8 @@ mod body_pace_tests {
         let b = body_pace_note(2000.0, 720, Some((10.0, 5.0))).unwrap();
         assert_eq!(a, b);
     }
-}
 
-#[cfg(test)]
-mod obs_tests {
-    use super::*;
-    use base64::Engine;
+    // ---- merged from former `mod obs_tests` ----
 
     /// OBS 对象必须是 10 个键，且每个值都是 gzip+base64。
     ///
@@ -3230,11 +3405,8 @@ mod obs_tests {
                 .unwrap_or_else(|e| panic!("{k} gzip 解压失败: {e}"));
         }
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    // ---- merged from former `mod tests` ----
 
     /// 回归：只有用户明确选了操场才反推跑道。
     ///
@@ -3598,10 +3770,9 @@ mod tests {
         let pace = 1000.0 / (p.distance_m / p.duration_sec as f64) / 60.0;
         assert!((3.0..=12.0).contains(&pace), "默认配速 {pace:.2} 不合理");
     }
-}
 
-#[cfg(test)]
-mod fixed_point_payload_tests {
+    // ---- merged from former `mod fixed_point_payload_tests` ----
+
     /// OBS 的 fixed_point_json 必须是裸点位数组。
     ///
     /// 之前把主报文那层 envelope（{fivePointJson, useZip, runAreaId, ...}）
@@ -3752,30 +3923,23 @@ mod fixed_point_payload_tests {
             );
         }
     }
-}
 
-#[cfg(test)]
-mod single_point_source_tests {
-    //! A4：**自检那份点位必须就是上传那份**（`docs/fix/FIX-A4-SINGLE-POINT-SOURCE.md`）。
-    //!
-    //! 修复前同一条轨迹被造了两次点位：
-    //!
-    //! - `submit::build` 那份：`seed = start_ms ^ φ`、做过 `smooth_point_speed`、
-    //!   带打卡点（`type=2` / `isFixed`）；
-    //! - `flow::detail_payload_rrid` 那份（**真正进 OBS 的**）：`seed = start_ms`、
-    //!   不平滑、不带打卡点。
-    //!
-    //! 于是 `id` / `count` / `radius` / `type` / `bdA` 逐点不同，`isFixed`、
-    //! `type=2` 只有上传那份才有——自检守着一份没人会看到的报文。
-    //!
-    //! 这组测试拿一条 1683m / 555 秒、5 个打卡点的离线对象（不联网、不提交）
-    //! 逐元素逐字段比对两份，白名单只允许 envelope 级字段。
+    // ---- merged from former `mod single_point_source_tests` ----
 
-    use super::*;
-    use crate::api::submit::{self, FixedPoint, SubmitParams};
-    use base64::Engine;
-    use flate2::read::GzDecoder;
-    use std::io::Read;
+    // A4：**自检那份点位必须就是上传那份**（`docs/fix/FIX-A4-SINGLE-POINT-SOURCE.md`）。
+    //
+    // 修复前同一条轨迹被造了两次点位：
+    //
+    // - `submit::build` 那份：`seed = start_ms ^ φ`、做过 `smooth_point_speed`、
+    //   带打卡点（`type=2` / `isFixed`）；
+    // - `flow::detail_payload_rrid` 那份（**真正进 OBS 的**）：`seed = start_ms`、
+    //   不平滑、不带打卡点。
+    //
+    // 于是 `id` / `count` / `radius` / `type` / `bdA` 逐点不同，`isFixed`、
+    // `type=2` 只有上传那份才有——自检守着一份没人会看到的报文。
+    //
+    // 这组测试拿一条 1683m / 555 秒、5 个打卡点的离线对象（不联网、不提交）
+    // 逐元素逐字段比对两份，白名单只允许 envelope 级字段。
 
     /// 真机 rrid 1328288734 的起始毫秒戳（点位 `flag` 用同一个值）。
     const START_MS: i64 = 1_790_913_882_164;
@@ -4180,11 +4344,8 @@ mod single_point_source_tests {
         }
         assert_points_identical(&probe.points, &uploaded, "自检 vs OBS 上传");
     }
-}
 
-#[cfg(test)]
-mod issue37_tests {
-    use super::*;
+    // ---- merged from former `mod issue37_tests` ----
 
     /// issue #37：操场默认关闭，走路网/按序串点；显式开关才试。
     #[test]

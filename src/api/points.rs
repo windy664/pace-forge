@@ -14,6 +14,7 @@ use super::client::{Client, expect_ok};
 use super::policy::point_xy;
 use crate::crypto::consts::{SIGN_SALT, hosts};
 use crate::crypto::envelope::{OuterOrder, now_ms, seal_with_order};
+use crate::error::{Error, ErrorKind};
 
 /// 点位接口路径（默认形态：`distance/1`）。
 pub const POINTS_PATH: &str = "/api/v560/get/1/distance/1";
@@ -77,7 +78,7 @@ pub fn fetch_points(
     lat: f64,
     lon: f64,
     run_area_id: Option<&str>,
-) -> Result<PointsContext, String> {
+) -> Result<PointsContext, Error> {
     fetch_points_at_distance(client, lat, lon, run_area_id, 1)
 }
 
@@ -91,12 +92,12 @@ pub fn fetch_points_at_distance(
     lon: f64,
     run_area_id: Option<&str>,
     distance_m: i64,
-) -> Result<PointsContext, String> {
+) -> Result<PointsContext, Error> {
     if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
-        return Err(format!("锚点越界: ({lat}, {lon})"));
+        return Err(ErrorKind::client(format!("锚点越界: ({lat}, {lon})")));
     }
     if lat == 0.0 && lon == 0.0 {
-        return Err("锚点不能是 (0,0)".into());
+        return Err(ErrorKind::client("锚点不能是 (0,0)".into()));
     }
 
     let uid = client
@@ -111,7 +112,7 @@ pub fn fetch_points_at_distance(
         .unwrap_or_else(|| "0".into());
 
     let url = format!("{}{}", hosts::RUN, points_path(distance_m));
-    let start_ms = now_ms() as i64;
+    let start_ms = now_ms();
     let runec_plain = runec_plain(&uid, lon, lat, start_ms);
     let env = seal_with_order(&runec_plain, OuterOrder::Observed)?;
 
@@ -134,7 +135,7 @@ pub fn fetch_points_at_distance(
 }
 
 /// 解析点位响应。
-pub fn parse_points(v: &Value) -> Result<PointsContext, String> {
+pub fn parse_points(v: &Value) -> Result<PointsContext, Error> {
     let payload = v.get("data").unwrap_or(v);
     let points = extract_points(payload)?;
     let coords = points.iter().filter_map(point_xy).collect();
@@ -153,11 +154,11 @@ pub fn parse_points(v: &Value) -> Result<PointsContext, String> {
 const EXTRACT_MAX_DEPTH: usize = 5;
 
 /// 从响应里找点位数组。
-fn extract_points(payload: &Value) -> Result<Vec<Value>, String> {
+fn extract_points(payload: &Value) -> Result<Vec<Value>, Error> {
     extract_points_depth(payload, 0)
 }
 
-fn extract_points_depth(payload: &Value, depth: usize) -> Result<Vec<Value>, String> {
+fn extract_points_depth(payload: &Value, depth: usize) -> Result<Vec<Value>, Error> {
     // 优先显式的打卡点字段名
     for name in [
         "pointsResModels",
@@ -181,7 +182,9 @@ fn extract_points_depth(payload: &Value, depth: usize) -> Result<Vec<Value>, Str
         }
     }
     if depth >= EXTRACT_MAX_DEPTH {
-        return Err("点位响应嵌套过深，已按畸形响应中止解析".into());
+        return Err(ErrorKind::protocol(
+            "点位响应嵌套过深，已按畸形响应中止解析".into(),
+        ));
     }
     // 再试一层嵌套
     for wrapper in ["result", "data"] {
@@ -281,7 +284,7 @@ pub fn fetch_points_cached(
     lat: f64,
     lng: f64,
     run_area_id: Option<&str>,
-) -> Result<PointsContext, String> {
+) -> Result<PointsContext, Error> {
     fetch_points_cached_at(client, lat, lng, run_area_id, None)
 }
 
@@ -296,7 +299,7 @@ pub fn fetch_points_cached_at(
     lng: f64,
     run_area_id: Option<&str>,
     fallback_distance_m: Option<i64>,
-) -> Result<PointsContext, String> {
+) -> Result<PointsContext, Error> {
     let key = |d: i64| format!("{}:{lat:.4},{lng:.4}:d{d}", run_area_id.unwrap_or("-"));
     let read = |k: &str| -> Option<PointsContext> {
         CACHE

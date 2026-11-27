@@ -171,7 +171,11 @@ pub fn speed_limit_ahead(s_list: &[f64], k_list: &[f64], s0: f64, p: &KinParams)
 /// 生成速度序列：OU 均值回归 + 热身 ramp + 弯道预判限速 + 精确命中总里程。
 ///
 /// 返回逐点速度（m/s），总里程精确等于 `target_dist`。
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the pace profile is a function of several independent physical
+    parameters; grouping them would hide which ones a caller sets"
+)]
 pub fn pace_profile(
     points: &[(f64, f64)],
     v0: f64,

@@ -19,12 +19,10 @@ fn normal_sample(rng: &mut impl rand::Rng) -> f64 {
 }
 
 /// 解析步频回归系数：读不到 / 不合法就用默认值。
-fn parse_cad_coeffs(intercept: Option<&str>, slope: Option<&str>) -> (f64, f64) {
-    let pick = |raw: Option<&str>, default: f64| {
-        raw.and_then(|v| v.trim().parse::<f64>().ok())
-            .filter(|v| v.is_finite())
-            .unwrap_or(default)
-    };
+fn parse_cad_coeffs(intercept: Option<f64>, slope: Option<f64>) -> (f64, f64) {
+    // 值的**语法**校验交给配置层（`parse_cad_coefficient`，非法值在启动时报错）；
+    // 这里只挡非有限数——配置也能被程序注入，那条路没有语法校验。
+    let pick = |raw: Option<f64>, default: f64| raw.filter(|v| v.is_finite()).unwrap_or(default);
     (pick(intercept, 34.4), pick(slope, 44.5))
 }
 
@@ -57,9 +55,10 @@ fn parse_cad_coeffs(intercept: Option<&str>, slope: Option<&str>) -> (f64, f64) 
 fn cad_coeffs() -> (f64, f64) {
     static COEFFS: std::sync::OnceLock<(f64, f64)> = std::sync::OnceLock::new();
     *COEFFS.get_or_init(|| {
-        let intercept = std::env::var("PACE_CAD_INTERCEPT").ok();
-        let slope = std::env::var("PACE_CAD_SLOPE").ok();
-        parse_cad_coeffs(intercept.as_deref(), slope.as_deref())
+        // 走配置快照：`PACE_CAD_INTERCEPT` / `PACE_CAD_SLOPE` 已登记进配置注册表，
+        // 由配置层统一读（env 与 config.toml 都支持，且非法值在启动时就报错）。
+        let cfg = crate::config::global();
+        parse_cad_coeffs(cfg.run.cad_intercept, cfg.run.cad_slope)
     })
 }
 
@@ -96,6 +95,8 @@ pub struct Gait {
 /// 恒定、步幅继续缩。端点上 2.0 m/s 恰好回到回归值 125，两段连续。
 pub const GAIT_REGRESSION_FLOOR_MPS: f64 = 2.0;
 
+/// 按速度（m/s）和疲劳度（0~1）给出步频与步幅；
+/// 低于 [`GAIT_REGRESSION_FLOOR_MPS`] 走慢速分支，不外推回归。
 pub fn gait(v: f64, fatigue: f64) -> Gait {
     if v >= GAIT_REGRESSION_FLOOR_MPS {
         let (intercept, slope) = cad_coeffs();
@@ -125,15 +126,13 @@ pub fn gait(v: f64, fatigue: f64) -> Gait {
         // 否则快慢两段在 2.0 m/s 处会断开。默认系数下端点仍取原来的
         // 0.9733（**逐字节不变**）。
         let (intercept, slope) = cad_coeffs();
-        let anchor_stride = if (intercept - 34.4).abs() < f64::EPSILON
-            && (slope - 44.5).abs() < f64::EPSILON
-        {
-            0.9733
-        } else {
-            (GAIT_REGRESSION_FLOOR_MPS * 60.0
-                / (intercept + slope * GAIT_REGRESSION_FLOOR_MPS))
-                .clamp(0.5, 1.2)
-        };
+        let anchor_stride =
+            if (intercept - 34.4).abs() < f64::EPSILON && (slope - 44.5).abs() < f64::EPSILON {
+                0.9733
+            } else {
+                (GAIT_REGRESSION_FLOOR_MPS * 60.0 / (intercept + slope * GAIT_REGRESSION_FLOOR_MPS))
+                    .clamp(0.5, 1.2)
+            };
         let stride0 = if v >= 1.40 {
             0.47 + (v - 1.40) * (anchor_stride - 0.47) / (2.0 - 1.40)
         } else {
@@ -262,16 +261,17 @@ mod tests {
         let (intercept, slope) = parse_cad_coeffs(None, None);
         assert_eq!(intercept, 34.4);
         assert_eq!(slope, 44.5);
-        // 不合法 / 空值也回落到默认（配错了不能悄悄变成别的行为）。
-        assert_eq!(parse_cad_coeffs(Some(""), Some("  ")), (34.4, 44.5));
-        assert_eq!(parse_cad_coeffs(Some("abc"), Some("nope")), (34.4, 44.5));
-        assert_eq!(parse_cad_coeffs(Some("nan"), Some("inf")), (34.4, 44.5));
+        // 非有限数也回落到默认（配置层会先挡掉语法非法值，这条是程序注入路径的兜底）。
+        assert_eq!(
+            parse_cad_coeffs(Some(f64::NAN), Some(f64::INFINITY)),
+            (34.4, 44.5)
+        );
     }
 
     /// 配了系数就用它：步频变高 ⇒ 步幅变短（步幅 = 速度×60/步频）。
     #[test]
     fn coefficients_can_be_overridden() {
-        let (intercept, slope) = parse_cad_coeffs(Some("45.3"), Some("44.5"));
+        let (intercept, slope) = parse_cad_coeffs(Some(45.3), Some(44.5));
         assert_eq!(intercept, 45.3);
         assert_eq!(slope, 44.5);
         // 默认公式在 2.78 m/s 给 158.1 步/分（步幅 1.055m）；

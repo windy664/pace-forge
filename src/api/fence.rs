@@ -15,6 +15,7 @@ use super::client::{Client, expect_ok};
 use super::coord::bd09_to_gcj02;
 use super::policy::point_xy;
 use crate::crypto::consts::hosts;
+use crate::error::{Error, ErrorKind};
 
 /// 围栏接口路径。
 pub const FENCE_PATH: &str = "/api/v1/getGeoFenceForRun";
@@ -28,11 +29,15 @@ pub const FENCE_PATH: &str = "/api/v1/getGeoFenceForRun";
 pub struct PassPoint {
     /// BD-09。
     pub lat: f64,
+    /// BD-09 经度。
     pub lon: f64,
     /// GCJ-02（有的响应只给这一套）。
     pub glat: f64,
+    /// GCJ-02 经度。
     pub glon: f64,
+    /// 服务端下发的是否固定点标记：`1` 是。
     pub is_fixed: i64,
+    /// 点名，仅展示。
     pub point_name: String,
 }
 
@@ -41,6 +46,7 @@ pub struct PassPoint {
 pub struct Fence {
     /// 服务端 id，`runAreaId` 通常取这个值。
     pub id: Option<i64>,
+    /// 围栏名（通常是校区名）。
     pub name: String,
     /// 闭合环，(lat, lon)，BD-09。
     pub ring: Vec<(f64, f64)>,
@@ -130,7 +136,9 @@ pub struct SelectedFence {
     pub polygons: Vec<Vec<(f64, f64)>>,
     /// 用于 `fixed_point_json` / OBS 的 `runAreaId`。
     pub run_area_id: i64,
+    /// 选中围栏的服务端 id（取第一个）；服务端没给则为 `None`。
     pub fence_id: Option<i64>,
+    /// 围栏名。
     pub name: String,
     /// 命中的围栏在原始列表里的下标。
     pub index: usize,
@@ -141,6 +149,7 @@ pub struct SelectedFence {
 /// 选择结果 + 兜底信息。
 #[derive(Debug, Clone)]
 pub struct FencePick {
+    /// 最终选中的围栏。
     pub selected: SelectedFence,
     /// 锚点不在任何围栏内，按最近围栏兜底。
     pub fallback: bool,
@@ -156,7 +165,7 @@ pub struct FencePick {
 ///
 /// **可能返回空数组**：`geoFences` 显式为 null（学校没配围栏）。调用方取
 /// 中心点走 [`center_from_fences`] / [`fetch_center`]，别直接索引 `[0]`。
-pub fn fetch_fences(client: &Client) -> Result<Vec<Fence>, String> {
+pub fn fetch_fences(client: &Client) -> Result<Vec<Fence>, Error> {
     let raw = client.request(
         "POST",
         &format!("{}{}", hosts::RUN, FENCE_PATH),
@@ -176,7 +185,10 @@ pub fn fetch_fences(client: &Client) -> Result<Vec<Fence>, String> {
     }
     let fences = parse_fences(&v)?;
     if fences.is_empty() {
-        return Err(format!("服务端下发的围栏不成边界（{}）", fence_diag(&v)));
+        return Err(ErrorKind::fence(format!(
+            "服务端下发的围栏不成边界（{}）",
+            fence_diag(&v)
+        )));
     }
     Ok(fences)
 }
@@ -185,14 +197,14 @@ pub fn fetch_fences(client: &Client) -> Result<Vec<Fence>, String> {
 ///
 /// `fetch_fences` 在 `geoFences=null` 时返回空数组（issue #34），调用方
 /// 直接取 `[0]` 会 panic（issue #36）。
-pub fn center_from_fences(fences: &[Fence]) -> Result<(f64, f64), String> {
+pub fn center_from_fences(fences: &[Fence]) -> Result<(f64, f64), Error> {
     let ring = match fences.first() {
         Some(f) if f.ring.len() >= 3 => &f.ring,
         _ => {
-            return Err(
+            return Err(ErrorKind::fence(
                 "服务端未配置围栏（geoFences=null）：请同时设置 PACE_CENTER_LAT 和 PACE_CENTER_LNG 指定校区锚点"
                     .to_string(),
-            )
+            ))
         }
     };
     let n = ring.len() as f64;
@@ -200,15 +212,16 @@ pub fn center_from_fences(fences: &[Fence]) -> Result<(f64, f64), String> {
     Ok((s.0 / n, s.1 / n))
 }
 
-/// `PACE_CENTER_LAT` / `PACE_CENTER_LNG` 锚点，两个都合法才生效。
+/// 围栏锚点：配置 `run.center_lat` / `run.center_lng`（env
+/// `PACE_CENTER_LAT` / `PACE_CENTER_LNG`）。成对校验在配置加载时完成，
+/// 这里只负责照搬。
 pub fn env_anchor() -> Option<(f64, f64)> {
-    let a = std::env::var("PACE_CENTER_LAT").ok()?.parse().ok()?;
-    let b = std::env::var("PACE_CENTER_LNG").ok()?.parse().ok()?;
-    Some((a, b))
+    let cfg = crate::config::global();
+    Some((cfg.run.center_lat?, cfg.run.center_lng?))
 }
 
 /// 锚点优先，否则取围栏质心。
-pub fn choose_center(anchor: Option<(f64, f64)>, fences: &[Fence]) -> Result<(f64, f64), String> {
+pub fn choose_center(anchor: Option<(f64, f64)>, fences: &[Fence]) -> Result<(f64, f64), Error> {
     match anchor {
         Some(a) => Ok(a),
         None => center_from_fences(fences),
@@ -216,7 +229,7 @@ pub fn choose_center(anchor: Option<(f64, f64)>, fences: &[Fence]) -> Result<(f6
 }
 
 /// CLI 的中心点来源：有锚点不发请求，否则拉围栏取质心。
-pub fn fetch_center(client: &Client) -> Result<(f64, f64), String> {
+pub fn fetch_center(client: &Client) -> Result<(f64, f64), Error> {
     match env_anchor() {
         Some(a) => Ok(a),
         None => center_from_fences(&fetch_fences(client)?),
@@ -355,7 +368,7 @@ fn fence_diag(v: &Value) -> String {
 }
 
 /// 解析围栏响应。
-pub fn parse_fences(v: &Value) -> Result<Vec<Fence>, String> {
+pub fn parse_fences(v: &Value) -> Result<Vec<Fence>, Error> {
     let data = v.get("data").unwrap_or(v);
     let fences = data
         .get("geoFences")
@@ -415,9 +428,9 @@ pub fn select_by_anchor(
     fences: &[Fence],
     anchor: (f64, f64),
     service_area_id: i64,
-) -> Result<FencePick, String> {
+) -> Result<FencePick, Error> {
     if fences.is_empty() {
-        return Err("没有可用围栏".into());
+        return Err(ErrorKind::fence("没有可用围栏".into()));
     }
     let containing: Vec<usize> = fences
         .iter()
@@ -465,7 +478,7 @@ pub fn select_by_anchor(
         .enumerate()
         .map(|(i, f)| (i, ring_min_distance(&f.ring, anchor)))
         .min_by(|a, b| a.1.total_cmp(&b.1))
-        .ok_or("没有可用围栏")?;
+        .ok_or_else(|| ErrorKind::fence("没有可用围栏".into()))?;
     let fence = &fences[index];
     Ok(FencePick {
         selected: SelectedFence {
@@ -549,10 +562,9 @@ pub fn geo_fence_json(
     // 改完整结构之后（11-16 起）App 只剩 4 个点。以有截图的那条为准。
     //
     // `run_area_id` / `fence_id` / `name` 三个参数留着不动签名，将来要回到
-    // 完整结构时，把下面这行换回注释里那版即可（`PACE_FENCE_FULL=1` 也能切）。
-    let full = std::env::var("PACE_FENCE_FULL")
-        .map(|v| v == "1")
-        .unwrap_or(false);
+    // 完整结构时，把下面这行换回注释里那版即可（配置 run.fence_full /
+    // `PACE_FENCE_FULL=1` 也能切）。
+    let full = crate::config::global().run.fence_full;
     if full {
         return json!([{
             "distance": 0.0,
@@ -611,11 +623,29 @@ fn ring_min_distance(ring: &[(f64, f64)], p: (f64, f64)) -> f64 {
 mod tests {
     use super::*;
 
+    /// 配置映射等价性：锚点成对注入 → env_anchor 返回 Some；
+    /// 撤销后回落 None（走围栏质心）。成对校验本身在 pace-forge-config 测。
+    #[test]
+    fn anchor_pair_comes_from_config() {
+        assert_eq!(env_anchor(), None, "默认无锚点");
+        let _g = crate::config::Guard::replace(crate::config::Config {
+            run: crate::config::Run {
+                center_lat: Some(30.5),
+                center_lng: Some(104.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert_eq!(env_anchor(), Some((30.5, 104.0)));
+    }
+
     /// issue #36：`geoFences=null` 的学校不能 panic，要给出可操作的错误。
     #[test]
     fn center_from_fences_rejects_unconfigured() {
         let e = center_from_fences(&[]).expect_err("empty fences must be rejected");
-        assert!(e.contains("PACE_CENTER_LAT"), "{e}");
+        // The kind matters as much as the text: this is a geometry problem (HTTP 400).
+        assert!(matches!(e, ErrorKind::Fence(_)), "{e:?}");
+        assert!(e.to_string().contains("PACE_CENTER_LAT"), "{e}");
     }
 
     /// 成环的围栏照样报错，但一个不成环的围栏不能 panic。
@@ -637,8 +667,8 @@ mod tests {
             &json!({ "data": { "geoFences": null } })
         ));
         assert_eq!(
-            choose_center(None, &[]).unwrap_err(),
-            center_from_fences(&[]).unwrap_err()
+            choose_center(None, &[]).unwrap_err().to_string(),
+            center_from_fences(&[]).unwrap_err().to_string()
         );
     }
 
@@ -928,8 +958,14 @@ mod tests {
             .map(|f| f.len())
             .unwrap_or(0);
         assert!(frac <= 6, "围栏坐标应保留 6 位小数，实际 {glat}");
-        // 完整结构：PACE_FENCE_FULL=1 时补上 distance / id / name
-        unsafe { std::env::set_var("PACE_FENCE_FULL", "1") };
+        // 完整结构：run.fence_full=1 时补上 distance / id / name
+        let _g = crate::config::Guard::replace(crate::config::Config {
+            run: crate::config::Run {
+                fence_full: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
         let full = geo_fence_json(1668, Some(1668), "学校", &ring);
         let vf: Value = serde_json::from_str(&full).unwrap();
         assert_eq!(
@@ -943,7 +979,6 @@ mod tests {
         let s2 = geo_fence_json(1775, None, "", &ring);
         let v2: Value = serde_json::from_str(&s2).unwrap();
         assert_eq!(v2[0]["id"], json!(1775));
-        unsafe { std::env::remove_var("PACE_FENCE_FULL") };
     }
 
     #[test]

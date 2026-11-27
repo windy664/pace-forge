@@ -64,15 +64,38 @@ impl Default for PointRule {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Risk {
     /// 相邻点间距过大，会被判非满分区。
-    WideGap { index: usize, gap_m: f64 },
+    WideGap {
+        /// 第几个点间。
+        index: usize,
+        /// 间距（米）。
+        gap_m: f64,
+    },
     /// 间距离谱，直接判异常。
-    HugeGap { index: usize, gap_m: f64 },
+    HugeGap {
+        /// 第几个点间。
+        index: usize,
+        /// 间距（米）。
+        gap_m: f64,
+    },
     /// 某个 10 秒桶位移超上限。
-    FastBucket { index: usize, dist_m: f64 },
+    FastBucket {
+        /// 第几个桶。
+        index: usize,
+        /// 桶内位移（米）。
+        dist_m: f64,
+    },
     /// 某个桶几乎没动。
-    StillBucket { index: usize, dist_m: f64 },
+    StillBucket {
+        /// 第几个桶。
+        index: usize,
+        /// 桶内位移（米）。
+        dist_m: f64,
+    },
     /// 桶里全是零，看起来像断点。
-    ZeroBuckets { count: usize },
+    ZeroBuckets {
+        /// 连续零位移的桶数。
+        count: usize,
+    },
 }
 
 impl Risk {
@@ -81,6 +104,7 @@ impl Risk {
         matches!(self, Risk::HugeGap { .. } | Risk::ZeroBuckets { .. })
     }
 
+    /// 给用户看的一句说明。
     pub fn describe(&self) -> String {
         match self {
             Risk::WideGap { index, gap_m } => {
@@ -105,6 +129,7 @@ impl Risk {
 /// 体检结果。
 #[derive(Debug, Clone, Default)]
 pub struct Report {
+    /// 查出来的问题，按发现顺序。
     pub risks: Vec<Risk>,
     /// 间距落在满分区间内的相邻点占比（0~1）。本地统计口径：只说明
     /// 这条轨迹像不像真跑，通过与否都不代表服务端审核或学校计分结果。
@@ -114,14 +139,17 @@ pub struct Report {
 }
 
 impl Report {
+    /// 有没有会拦截提交的问题。
     pub fn blocked(&self) -> bool {
         self.risks.iter().any(|r| r.blocking())
     }
 
+    /// 每个问题一行说明。
     pub fn lines(&self) -> Vec<String> {
         self.risks.iter().map(|r| r.describe()).collect()
     }
 
+    /// 一行总览（通过与否 + 关键占比）。
     pub fn summary(&self) -> String {
         if self.risks.is_empty() {
             format!(

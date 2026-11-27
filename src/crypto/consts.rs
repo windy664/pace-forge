@@ -60,9 +60,12 @@ pub const CODE_SERVER_FAULT: i64 = -10000;
 
 /// 网关主机。
 pub mod hosts {
+    /// 主业务网关。
     pub const RUN: &str = "https://run.gxapp.iydsj.com";
+    /// 服务发现网关。
     pub const DISCOVERY: &str = "https://discovery.gxapp.iydsj.com";
     /// 埋点专用。注意 `startup/pv` 只在这个 host 上存在，run 会返回 404。
     pub const DATAPOINT: &str = "https://datapoint.gxapp.iydsj.com";
+    /// 合作方接口网关。
     pub const PARTNER: &str = "https://partner.iydsj.com";
 }

@@ -7,6 +7,8 @@
 //! 所有函数显式接收 `now`，不读系统时钟：调用方读一次真实时钟传进来，
 //! 测试就能用固定时刻复现，不会因为跑测试的时间点不同而时好时坏。
 
+use crate::error::{Error, ErrorKind};
+
 /// 提交时的 0~4 秒抖动，预留 5 秒余量。
 pub const JITTER_MARGIN_MS: i64 = 5_000;
 /// 最多往前补 3 天。
@@ -23,12 +25,15 @@ pub const DEFAULT_AGO_MIN: i64 = 30;
 pub const DEFAULT_AGO_MAX: i64 = 300;
 /// 随机时刻模式的窗口（本地时区小时）。
 pub const RAND_HOUR_LO: u32 = 7;
+/// 随机时刻窗口上界（本地时区 20 点）。
 pub const RAND_HOUR_HI: u32 = 20;
 
 /// 计算结果。`clamped` 为 true 表示原时刻会让结束时间越过当前，已提前。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StartTime {
+    /// 起跑时间戳（毫秒）。
     pub ms: i64,
+    /// 原时刻会让结束时间晚于现在，已被提前。
     pub clamped: bool,
 }
 
@@ -75,7 +80,7 @@ pub fn clamp(start_ms: i64, now_ms: i64, dur_s: i64) -> StartTime {
 }
 
 /// 解析 `HH:MM`（也接受只有小时 `H`，分钟按 0）。
-pub fn parse_hhmm(s: &str) -> Result<(u32, u32), String> {
+pub fn parse_hhmm(s: &str) -> Result<(u32, u32), Error> {
     let s = s.trim();
     let (h, m) = s.split_once(':').unwrap_or((s, "0"));
     let num = |part: &str, max: u32| -> Option<u32> {
@@ -86,16 +91,20 @@ pub fn parse_hhmm(s: &str) -> Result<(u32, u32), String> {
     };
     match (num(h, 23), num(m, 59)) {
         (Some(h), Some(m)) => Ok((h, m)),
-        _ => Err(format!("时间格式应为 HH:MM（00:00-23:59），收到 {s:?}")),
+        _ => Err(ErrorKind::client(format!(
+            "时间格式应为 HH:MM（00:00-23:59），收到 {s:?}"
+        ))),
     }
 }
 
 /// 校验天数偏移（0=今天，最多 3 天前）。
-pub fn check_days_ago(days_ago: i64) -> Result<i64, String> {
+pub fn check_days_ago(days_ago: i64) -> Result<i64, Error> {
     if (0..=MAX_DAYS_AGO).contains(&days_ago) {
         Ok(days_ago)
     } else {
-        Err(format!("天数应为 0-{MAX_DAYS_AGO}，收到 {days_ago}"))
+        Err(ErrorKind::client(format!(
+            "天数应为 0-{MAX_DAYS_AGO}，收到 {days_ago}"
+        )))
     }
 }
 
@@ -108,8 +117,8 @@ pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400; // [0, 399]
-    let mp = ((m as i64) + 9) % 12; // 3月=0
-    let doy = (153 * mp + 2) / 5 + (d as i64) - 1; // [0, 365]
+    let mp = (i64::from(m) + 9) % 12; // 3月=0
+    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1; // [0, 365]
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
     era * 146_097 + doe - 719_468
 }
@@ -123,8 +132,8 @@ pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
     let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let d = crate::number::i64_to_u32(doy - (153 * mp + 2) / 5 + 1).unwrap_or(1); // [1, 31]
+    let m = crate::number::i64_to_u32(if mp < 10 { mp + 3 } else { mp - 9 }).unwrap_or(1); // [1, 12]
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
@@ -166,25 +175,27 @@ pub fn specified(
     hour: u32,
     minute: u32,
     dur_s: i64,
-) -> Result<StartTime, String> {
+) -> Result<StartTime, Error> {
     let days_ago = check_days_ago(days_ago)?;
     if hour > 23 || minute > 59 {
-        return Err(format!("无效时刻 {hour:02}:{minute:02}"));
+        return Err(ErrorKind::client(format!("无效时刻 {hour:02}:{minute:02}")));
     }
     let tz = default_tz_offset_min();
     let local_now = now_ms + tz * 60_000;
     let today = local_now.div_euclid(86_400_000);
     let target_day = today - days_ago;
     let local_target =
-        target_day * 86_400_000 + (hour as i64) * 3_600_000 + (minute as i64) * 60_000;
+        target_day * 86_400_000 + i64::from(hour) * 3_600_000 + i64::from(minute) * 60_000;
     let start_ms = local_target - tz * 60_000;
     Ok(clamp(start_ms, now_ms, dur_s))
 }
 
 /// `ago N`：N 分钟前开跑（1 ≤ N ≤ 4320，即最多 3 天）。
-pub fn ago(now_ms: i64, ago_min: i64, dur_s: i64) -> Result<StartTime, String> {
+pub fn ago(now_ms: i64, ago_min: i64, dur_s: i64) -> Result<StartTime, Error> {
     if !(1..=MAX_AGO_MIN).contains(&ago_min) {
-        return Err(format!("分钟数应为 1-{MAX_AGO_MIN}，收到 {ago_min}"));
+        return Err(ErrorKind::client(format!(
+            "分钟数应为 1-{MAX_AGO_MIN}，收到 {ago_min}"
+        )));
     }
     Ok(clamp(now_ms - ago_min * 60_000, now_ms, dur_s))
 }
@@ -197,12 +208,13 @@ pub fn random_ago(now_ms: i64, dur_s: i64, r: f64) -> StartTime {
         0.0
     };
     let span_ms = ((DEFAULT_AGO_MAX - DEFAULT_AGO_MIN) * 60_000) as f64;
-    let start = now_ms - DEFAULT_AGO_MIN * 60_000 - (r * span_ms) as i64;
+    let start =
+        now_ms - DEFAULT_AGO_MIN * 60_000 - crate::number::f64_to_i64(r * span_ms).unwrap_or(0);
     clamp(start, now_ms, dur_s)
 }
 
 /// 指定日期内的随机时刻（7:00~20:00）。`r` ∈ [0,1)。
-pub fn random_in_day(now_ms: i64, days_ago: i64, dur_s: i64, r: f64) -> Result<StartTime, String> {
+pub fn random_in_day(now_ms: i64, days_ago: i64, dur_s: i64, r: f64) -> Result<StartTime, Error> {
     let days_ago = check_days_ago(days_ago)?;
     let r = if r.is_finite() {
         r.clamp(0.0, 1.0)
@@ -212,8 +224,9 @@ pub fn random_in_day(now_ms: i64, days_ago: i64, dur_s: i64, r: f64) -> Result<S
     let tz = default_tz_offset_min();
     let today = (now_ms + tz * 60_000).div_euclid(86_400_000);
     let day = today - days_ago;
-    let span_min = ((RAND_HOUR_HI - RAND_HOUR_LO) * 60) as f64;
-    let minute_of_day = (RAND_HOUR_LO as f64 * 60.0 + r * span_min) as i64;
+    let span_min = f64::from((RAND_HOUR_HI - RAND_HOUR_LO) * 60);
+    let minute_of_day =
+        crate::number::f64_to_i64(f64::from(RAND_HOUR_LO) * 60.0 + r * span_min).unwrap_or(0);
     let local_target = day * 86_400_000 + minute_of_day * 60_000;
     Ok(clamp(local_target - tz * 60_000, now_ms, dur_s))
 }
@@ -222,7 +235,7 @@ pub fn random_in_day(now_ms: i64, days_ago: i64, dur_s: i64, r: f64) -> Result<S
 pub fn seeded_unit(seed: &str) -> f64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in seed.as_bytes() {
-        h ^= *b as u64;
+        h ^= u64::from(*b);
         h = h.wrapping_mul(0x100000001b3);
     }
     (h % 1_000_000) as f64 / 1_000_000.0

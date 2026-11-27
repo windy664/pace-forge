@@ -144,11 +144,8 @@ mod tests {
         let (lat, lng) = (48.8566, 2.3522); // 巴黎
         assert_eq!(wgs84_to_gcj02(lat, lng), (lat, lng));
     }
-}
 
-#[cfg(test)]
-mod point_coord_tests {
-    use super::*;
+    // ---- merged from former `mod point_coord_tests` ----
 
     /// 采样点位的 lat/lon 与 glat/glon 到底是什么关系。
     ///

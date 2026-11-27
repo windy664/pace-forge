@@ -1,0 +1,44 @@
+# CodeRabbit configuration. Reference: https://docs.coderabbit.ai/reference/configuration
+# Review comments are posted in Chinese; code comments and commit messages stay English.
+language: "zh-CN"
+enable_free_tier: true
+
+reviews:
+  # Only the feedback that matters; style is already enforced by rustfmt and clippy in CI.
+  profile: "quiet"
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  sequence_diagrams: false
+  related_issues: false
+  related_prs: false
+  suggested_reviewers: false
+  auto_apply_labels: false
+  path_filters:
+    - "!Cargo.lock"
+    - "!target/**"
+    - "!evidence/**"
+    - "!data/**"
+  path_instructions:
+    - path: "src/**"
+      instructions: |
+        - Do not comment on formatting, naming, import order or anything clippy already
+        checks (the workspace denies unsafe, unwrap, expect and panic in production code).
+        - Focus on logic errors, arithmetic mistakes and behaviour changes.
+        - Request payloads must stay byte-identical to the vendor app samples in `evidence/`;
+        flag any change to field order, key names or number formatting.
+        - Never suggest logging, printing or committing account credentials or tokens.
+        - New config keys must be registered in `crates/pace-forge-config`.
+    - path: "src/api/**"
+      instructions: |
+        - Check that vendor error codes are classified, not matched by substring.
+    - path: "src/track/**"
+      instructions: |
+        - Watch for off-by-one on the 10-second bucketing and for f64/i64 casts.
+    - path: "src/web/**"
+      instructions: |
+        - Every route must go through the console auth check; flag any handler reachable without it.
+        - Writes from a cross-site origin must stay rejected.
+
+chat:
+  auto_reply: true

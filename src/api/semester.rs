@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 
 use super::client::{Client, expect_ok};
 use crate::crypto::consts::hosts;
+use crate::error::Error;
 
 /// 学期汇总路径。
 pub const SUMMARY_PATH: &str = "/api/v55/runnings/recordssummary/semester";
@@ -131,12 +132,12 @@ impl SemesterGoal {
 /// 空 body 拿回来的是空学期（`sname: ""`、`semesterValidDis: 0`），
 /// 而 `goal` 接口同时返回 sid=9679 和有效的学期名。服务端显然要按
 /// sid 查，所以这里先取 goal 拿 sid 再请求汇总。
-pub fn fetch_summary(client: &Client) -> Result<SemesterSummary, String> {
+pub fn fetch_summary(client: &Client) -> Result<SemesterSummary, Error> {
     fetch_summary_for(client, None)
 }
 
 /// 按指定学期查汇总。`sid` 为 None 时先问 goal 接口。
-pub fn fetch_summary_for(client: &Client, sid: Option<i64>) -> Result<SemesterSummary, String> {
+pub fn fetch_summary_for(client: &Client, sid: Option<i64>) -> Result<SemesterSummary, Error> {
     let sid = match sid {
         Some(s) => Some(s),
         None => fetch_goal(client, 1).ok().map(|g| g.sid).filter(|s| *s > 0),
@@ -177,7 +178,7 @@ pub fn parse_summary(v: &Value) -> SemesterSummary {
 }
 
 /// 查个人学期目标（runMode=1 校园跑 / 记分跑）。
-pub fn fetch_goal(client: &Client, run_mode: i64) -> Result<SemesterGoal, String> {
+pub fn fetch_goal(client: &Client, run_mode: i64) -> Result<SemesterGoal, Error> {
     let raw = client.request(
         "POST",
         &format!("{}{}", hosts::RUN, PERSONAL_PATH),
@@ -211,17 +212,23 @@ pub fn parse_goal(v: &Value) -> SemesterGoal {
             "semesterTargetDis",
             "selDistance",
         ]),
-        target_count: num(&["targetCount", "semesterTargetCount", "selCount"]) as i64,
-        begin_ms: num(&["startDate", "beginTime", "startTime"]) as i64,
-        end_ms: num(&["endDate", "endTime", "stopTime"]) as i64,
+        target_count: crate::number::f64_to_i64(num(&[
+            "targetCount",
+            "semesterTargetCount",
+            "selCount",
+        ]))
+        .unwrap_or(0),
+        begin_ms: crate::number::f64_to_i64(num(&["startDate", "beginTime", "startTime"]))
+            .unwrap_or(0),
+        end_ms: crate::number::f64_to_i64(num(&["endDate", "endTime", "stopTime"])).unwrap_or(0),
         sname: d
             .get("sname")
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string(),
         valid_dis: num(&["semesterValid"]),
-        goal_method: num(&["goalMethod"]) as i64,
-        sid: num(&["sid"]) as i64,
+        goal_method: crate::number::f64_to_i64(num(&["goalMethod"])).unwrap_or(0),
+        sid: crate::number::f64_to_i64(num(&["sid"])).unwrap_or(0),
         raw: d.clone(),
     }
 }
@@ -231,11 +238,7 @@ pub fn parse_goal(v: &Value) -> SemesterGoal {
 ///
 /// 返回 (有效计分跑次数, 这些跑分布在多少个自然日)。次数按「服务端自己给的
 /// validDis > 0」计，不做任何日上限假设——日上限那套只影响里程，不影响次数。
-pub fn derived_count(
-    client: &Client,
-    begin_ms: i64,
-    end_ms: i64,
-) -> Result<(usize, usize), String> {
+pub fn derived_count(client: &Client, begin_ms: i64, end_ms: i64) -> Result<(usize, usize), Error> {
     use std::collections::BTreeSet;
     let mut days: BTreeSet<String> = BTreeSet::new();
     let mut runs = 0usize;
@@ -376,11 +379,8 @@ mod tests {
         assert!(!g.in_term(1_700_000_000_000 - 86_400_000));
         assert_eq!(g.days_left(1_700_000_000_000 + 90 * 86_400_000), 10);
     }
-}
 
-#[cfg(test)]
-mod real_payload_tests {
-    use super::*;
+    // ---- merged from former `mod real_payload_tests` ----
 
     /// 7.4.01 响应结构（字段名经实测确认，账号信息已脱敏）
     #[test]

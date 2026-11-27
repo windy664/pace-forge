@@ -22,12 +22,16 @@ use super::biomech::{fatigue_from_km, ou_cadence_series};
 use super::buckets::{SpeedBucket, StepBucket, speed_buckets};
 use super::geo::{distance, path_length};
 use super::kinematics::{KinParams, pace_profile};
+use crate::error::{Error, ErrorKind};
 
 /// 合成参数。
 #[derive(Debug, Clone)]
 pub struct SimParams {
+    /// 目标里程（米）。
     pub total_distance_m: f64,
+    /// 目标时长（秒）。
     pub total_sec: i64,
+    /// 起跑时间戳（毫秒）。
     pub start_ms: i64,
     /// 目标步数。`None` 表示完全由步态模型决定。
     pub target_steps: Option<i32>,
@@ -35,7 +39,9 @@ pub struct SimParams {
     pub v_floor: f64,
     /// 速度剖面上限（m/s）。
     pub v_ceil: f64,
+    /// 运动学参数。
     pub kin: KinParams,
+    /// 随机种子。
     pub seed: u64,
 }
 
@@ -67,19 +73,21 @@ pub struct SimResult {
     pub total_steps: i32,
     /// 平均步频（步/分）。
     pub avg_cadence: f64,
+    /// 速度桶（10 秒一桶）。
     pub speed_buckets: Vec<SpeedBucket>,
+    /// 步频桶。
     pub step_buckets: Vec<StepBucket>,
     /// 实际总里程（应精确等于 `total_distance_m`）。
     pub actual_length_m: f64,
 }
 
 /// 从轨迹点合成完整数据流。
-pub fn simulate(points: &[(f64, f64, i64)], p: &SimParams) -> Result<SimResult, String> {
+pub fn simulate(points: &[(f64, f64, i64)], p: &SimParams) -> Result<SimResult, Error> {
     if points.len() < 2 {
-        return Err("轨迹点不足，无法合成".into());
+        return Err(ErrorKind::fence("轨迹点不足，无法合成".into()));
     }
     if p.total_sec <= 0 {
-        return Err("时长必须为正".into());
+        return Err(ErrorKind::fence("时长必须为正".into()));
     }
 
     let xy: Vec<(f64, f64)> = points.iter().map(|(a, b, _)| (*a, *b)).collect();
@@ -90,7 +98,7 @@ pub fn simulate(points: &[(f64, f64, i64)], p: &SimParams) -> Result<SimResult, 
 
     let total_len = path_length(&xy);
     if total_len <= 0.0 {
-        return Err("轨迹长度为 0".into());
+        return Err(ErrorKind::fence("轨迹长度为 0".into()));
     }
 
     // ① 速度剖面：OU + 弯道预判 + 精确命中里程
@@ -301,6 +309,10 @@ fn distribute_steps(
 /// 对 `[begin, end)` 区间积分步频（步/分），返回步数。
 ///
 /// 线性插值 + 梯形法，端点精确落在区间边界上。
+#[expect(
+    clippy::unwrap_used,
+    reason = "non-empty is guaranteed by the guard above"
+)]
 fn integrate_cadence(times: &[i64], cadences: &[f64], begin: i64, end: i64) -> f64 {
     if end <= begin || times.len() < 2 {
         return 0.0;
@@ -512,6 +524,7 @@ pub fn validate(r: &SimResult, p: &SimParams) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     /// 慢速跑（巡航 <2.0 m/s）的步频不跟瞬时速度扫：真机慢跑步频顶在
     /// 179 一带的稳值上（issue #7），速度起伏全由步幅吸收。
     #[test]
@@ -559,8 +572,6 @@ mod tests {
             "步频 sd {sd:.1} 过大：瞬时速度不该拖着步频来回扫"
         );
     }
-
-    use super::*;
 
     fn straight_track(n: usize, sec: i64) -> Vec<(f64, f64, i64)> {
         let step_t = sec * 1000 / (n as i64 - 1);
@@ -656,11 +667,8 @@ mod tests {
         p.total_sec = 0;
         assert!(simulate(&straight_track(10, 100), &p).is_err());
     }
-}
 
-#[cfg(test)]
-mod time_precision_tests {
-    use super::*;
+    // ---- merged from former `mod time_precision_tests` ----
 
     /// 相邻采样点必须至少相隔 1 秒。
     ///

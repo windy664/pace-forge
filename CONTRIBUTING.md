@@ -20,7 +20,9 @@
 ## 提交纪律
 
 - `cargo test --lib` 全绿、`cargo clippy --all-targets` 0 警告。
-- 两套检查码别混：`PACE_*` 是环境变量（`config` 表里那张），`AUDIT_*` 是
+- 两套检查码别混：`PACE_*` 是配置开关（env 覆盖 `config.toml`，键/词汇表/默认值
+  都在 `crates/pace-forge-config` 的注册表一张表里，新增开关三处同步：
+  注册表 + `Config` 字段 + `key_values` 显示，少一处测试直接红），`AUDIT_*` 是
   `audit` 的阈值命中（`src/api/audit.rs` 的常量表），`preflight` 的检查码是第三套。
 - 提交信息只描述问题本身：哪里会坏、什么条件下坏、怎么改的。不用任何编号体系（不要写 B-01 这类），一个提交讲一个主题，能独立通过测试。
 - 行为修复带回归测试；只改注释也欢迎（把失效的依据更正掉同样是贡献）。

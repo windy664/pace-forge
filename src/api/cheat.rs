@@ -15,6 +15,7 @@
 //! 2. **检查结果会过期**。名单是服务端跑批出来的，本地缓存超过
 //!    [`FRESH_MS`] 就只是「上次查过」，不能当现在的状态。
 
+use crate::error::Error;
 use serde_json::Value;
 
 /// 自查结果的有效期：5 分钟。
@@ -37,6 +38,7 @@ pub enum Status {
 }
 
 impl Status {
+    /// 给用户看的状态说明。
     pub fn label(self) -> &'static str {
         match self {
             Status::NoRecord => "暂未发现违规记录",
@@ -63,9 +65,12 @@ pub struct CheatReport {
 impl CheatReport {
     /// 从接口的 `data` 构造。`data` 不是对象就是格式异常——直接报错，
     /// 不要退回空报告（空报告会被读成「没有违规」）。
-    pub fn from_data(data: &Value, checked_at_ms: i64) -> Result<Self, String> {
+    pub fn from_data(data: &Value, checked_at_ms: i64) -> Result<Self, Error> {
         if !data.is_object() {
-            return Err("违规接口数据格式异常，无法判断".into());
+            return Err(Error::Protocol {
+                code: None,
+                msg: "违规接口数据格式异常，无法判断".into(),
+            });
         }
         Ok(Self {
             self_info: data.get("self").cloned().unwrap_or(Value::Null),
@@ -114,7 +119,7 @@ impl CheatReport {
 
     /// 依据当前时钟的状态。
     pub fn status(&self) -> Status {
-        self.status_at(crate::crypto::envelope::now_ms() as i64)
+        self.status_at(crate::crypto::envelope::now_ms())
     }
 
     /// 服务端给的原因（字段名在不同版本里不一样，逐个试）。
@@ -165,7 +170,7 @@ impl CheatReport {
         let at = if self.checked_at_ms > 0 {
             self.checked_at_ms
         } else {
-            crate::crypto::envelope::now_ms() as i64
+            crate::crypto::envelope::now_ms()
         };
         let mut parts = vec![format!("状态：{}", self.status_at(at).label())];
         if let Some(n) = self.count() {
@@ -200,7 +205,7 @@ pub fn query(
     client: &crate::api::Client,
     page: i64,
     log: &mut dyn FnMut(&str),
-) -> Result<CheatReport, String> {
+) -> Result<CheatReport, Error> {
     let unid: i64 = client
         .credentials()
         .and_then(|c| c.unid.as_ref())
@@ -214,14 +219,15 @@ pub fn query(
     )?;
     let v = crate::api::client::expect_ok(&raw)?;
     let data = v.get("data").cloned().unwrap_or(Value::Null);
-    let report = CheatReport::from_data(&data, crate::crypto::envelope::now_ms() as i64)?;
+    let report = CheatReport::from_data(&data, crate::crypto::envelope::now_ms())?;
     log(&format!("[cheat] {}", report.summary()));
     Ok(report)
 }
 
 #[cfg(test)]
-mod clock_skew_tests {
+mod tests {
     use super::*;
+    use serde_json::json;
 
     fn report(checked: i64) -> CheatReport {
         CheatReport {
@@ -247,12 +253,8 @@ mod clock_skew_tests {
         );
         assert_eq!(report(10_000).status_at(10_000 + FRESH_MS), Status::Stale);
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
+    // ---- merged from former `mod tests` ----
 
     const T0: i64 = 1_700_000_000_000;
 

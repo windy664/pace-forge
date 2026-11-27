@@ -13,17 +13,22 @@ use super::geo::distance;
 /// 速度桶。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpeedBucket {
+    /// 桶内位移（米）。
     pub distance: f64,
     #[serde(rename = "beginTime")]
+    /// 桶起始时间戳（毫秒）。
     pub begin_time: i64,
     #[serde(rename = "endTime")]
+    /// 桶结束时间戳（毫秒）。
     pub end_time: i64,
     /// 整次跑步的起始毫秒戳（每桶都填同一个值）。
     pub flag: i64,
     /// 桶 id：提交用 `60000+i`，OBS 用 `(rrid%100000)*1000+endSec`。
     pub id: i64,
+    /// 恒 0，照真机报文。
     pub state: i32,
     #[serde(rename = "queueNum")]
+    /// 桶序号（`queueNum`）。
     pub queue_num: i32,
 }
 
@@ -31,21 +36,31 @@ pub struct SpeedBucket {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepBucket {
     #[serde(rename = "stepsNum")]
+    /// 桶内步数。
     pub steps_num: i32,
     #[serde(rename = "beginTime")]
+    /// 桶起始时间戳（毫秒）。
     pub begin_time: i64,
     #[serde(rename = "endTime")]
+    /// 桶结束时间戳（毫秒）。
     pub end_time: i64,
+    /// 整次跑步的起始毫秒戳。
     pub flag: i64,
+    /// 桶 id，规则同速度桶。
     pub id: i64,
     #[serde(rename = "maxDiff")]
+    /// 桶内最大步频差。
     pub max_diff: i32,
     #[serde(rename = "minDiff")]
+    /// 桶内最小步频差。
     pub min_diff: i32,
     #[serde(rename = "avgDiff")]
+    /// 桶内平均步频差。
     pub avg_diff: i32,
+    /// 恒 0，照真机报文。
     pub state: i32,
     #[serde(rename = "queueNum")]
+    /// 桶序号（`queueNum`）。
     pub queue_num: i32,
 }
 
@@ -210,6 +225,84 @@ pub fn make_jitter(n: usize, amp: f64, seed: u64) -> Vec<f64> {
         .collect()
 }
 
+/// 桶网格上的起步窗口长度（**整桶数**）。
+///
+/// 真机 555 秒 → 起步窗口 [`super::startup_sec`] = 86 秒 → `86 / 10 = 8` 个桶：
+/// 前 8 个桶（0~80s）`queueNum` 恒 0、速度桶 `state=2`；第 9 个桶（80~90s）
+/// 真正跨过 86 秒这条线，真机把它算进「已起步」。所以这里取**整桶截断**
+/// （floor），不是四舍五入——`86/10` 用 `round` 会得到 9，前面就多一个 0。
+///
+/// 这个 8 不是从点位那边套过来的：点位 `su=19`（86 秒内的 19 个采样点），
+/// 桶 `su=8`，两者是同一个时间窗口在两张不同网格上的落点。
+pub fn bucket_startup(total_sec: i64) -> usize {
+    (super::startup_sec(total_sec) / 10).max(0) as usize
+}
+
+/// 提交报文用的桶 id：`60000+i`，`queueNum` 走与点位同一个分区函数。
+///
+/// 服务端在提交时按这个规则校验；和 OBS 对象里的 id 规则**不同**（OBS 是
+/// 服务端自增列量级的连续 id）。
+///
+/// `queueNum` 早先写成 `queue_num: i as i32`（桶序号原样），55 个桶于是变成
+/// 0..54 —— 真机全场 `queueNum` 上限是 24，0..54 里有一大半落在不存在的台阶上，
+/// 整个字段语义是错的（不是「差几档」，是另一个量纲）。现在与 OBS 桶、
+/// 与点位共用 [`super::queue_num`]，`su` 用桶自己的起步窗口。
+pub fn apply_submit_ids(speed: &mut [SpeedBucket], steps: &mut [StepBucket]) {
+    let n = speed.len().max(steps.len());
+    let su = bucket_startup((n as i64) * 10);
+    for (i, b) in speed.iter_mut().enumerate() {
+        b.id = 60000 + i as i64;
+        b.queue_num = super::queue_num(i, n, su);
+    }
+    for (i, b) in steps.iter_mut().enumerate() {
+        b.id = 60000 + i as i64;
+        b.queue_num = super::queue_num(i, n, su);
+    }
+}
+
+/// OBS 对象用的桶 id / `queueNum` / `state`。
+///
+/// 真机依据（`evidence/obs_real_20261002.json`，55 个速度桶 + 55 个步频桶）：
+///
+/// - `id` **连续递增**（1628、1629、…、1682），不是按 `endSec` 跳号。
+///   旧实现用 `(rrid%100000)*1000+endSec`，同一个数组里相邻桶的 id 差 10；
+/// - 两个数组共用同一条 id 序列（速度桶和步频桶第 i 项 id 相同）；
+/// - `queueNum` 起步段（前 8 个桶）是 0，之后**每 2 个桶 +1** 到 24
+///   （`8→1、10→2、…、54→24`，55 个桶逐元素与真机一致）；
+/// - `speed_json` 的 `state`：起步段的 8 个桶是 **2**，其余 47 个是 **0**。
+///   起步段（前 86 秒）配速还没起来，App 把这几个桶标成「非正常」；
+/// - `step_freq_json` 的 `state` 恒 0。
+///
+/// 依赖提交返回的 `rrid`，所以 OBS 必须在提交**之后**上传。
+pub fn apply_obs_ids(
+    speed: &mut [SpeedBucket],
+    steps: &mut [StepBucket],
+    rrid: i64,
+    start_ms: i64,
+) {
+    // 真机 id 是服务端自增列（1628 起）。客户端只需落在同量级、且同一条
+    // 记录内连续递增，所以按 rrid + 起始时间派生一个稳定偏移。
+    let base =
+        1600 + (((rrid as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ start_ms as u64) % 400) as i64;
+    let n = speed.len().max(steps.len());
+    let total_sec = speed
+        .last()
+        .map(|b| (b.end_time - start_ms) / 1000)
+        .unwrap_or(10)
+        .max(10);
+    let su = bucket_startup(total_sec);
+    for (i, b) in speed.iter_mut().enumerate() {
+        b.id = base + i as i64;
+        b.queue_num = super::queue_num(i, n, su);
+        b.state = if i < su { 2 } else { 0 };
+    }
+    for (i, b) in steps.iter_mut().enumerate() {
+        b.id = base + i as i64;
+        b.queue_num = super::queue_num(i, n, su);
+        b.state = 0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,89 +384,8 @@ mod tests {
         let b = speed_buckets(&pts, 0, 5);
         assert_eq!(b.len(), 1, "不足 10 秒也要有一个桶，不能返回空");
     }
-}
 
-/// 桶网格上的起步窗口长度（**整桶数**）。
-///
-/// 真机 555 秒 → 起步窗口 [`super::startup_sec`] = 86 秒 → `86 / 10 = 8` 个桶：
-/// 前 8 个桶（0~80s）`queueNum` 恒 0、速度桶 `state=2`；第 9 个桶（80~90s）
-/// 真正跨过 86 秒这条线，真机把它算进「已起步」。所以这里取**整桶截断**
-/// （floor），不是四舍五入——`86/10` 用 `round` 会得到 9，前面就多一个 0。
-///
-/// 这个 8 不是从点位那边套过来的：点位 `su=19`（86 秒内的 19 个采样点），
-/// 桶 `su=8`，两者是同一个时间窗口在两张不同网格上的落点。
-pub fn bucket_startup(total_sec: i64) -> usize {
-    (super::startup_sec(total_sec) / 10).max(0) as usize
-}
-
-/// 提交报文用的桶 id：`60000+i`，`queueNum` 走与点位同一个分区函数。
-///
-/// 服务端在提交时按这个规则校验；和 OBS 对象里的 id 规则**不同**（OBS 是
-/// 服务端自增列量级的连续 id）。
-///
-/// `queueNum` 早先写成 `queue_num: i as i32`（桶序号原样），55 个桶于是变成
-/// 0..54 —— 真机全场 `queueNum` 上限是 24，0..54 里有一大半落在不存在的台阶上，
-/// 整个字段语义是错的（不是「差几档」，是另一个量纲）。现在与 OBS 桶、
-/// 与点位共用 [`super::queue_num`]，`su` 用桶自己的起步窗口。
-pub fn apply_submit_ids(speed: &mut [SpeedBucket], steps: &mut [StepBucket]) {
-    let n = speed.len().max(steps.len());
-    let su = bucket_startup((n as i64) * 10);
-    for (i, b) in speed.iter_mut().enumerate() {
-        b.id = 60000 + i as i64;
-        b.queue_num = super::queue_num(i, n, su);
-    }
-    for (i, b) in steps.iter_mut().enumerate() {
-        b.id = 60000 + i as i64;
-        b.queue_num = super::queue_num(i, n, su);
-    }
-}
-
-/// OBS 对象用的桶 id / `queueNum` / `state`。
-///
-/// 真机依据（`evidence/obs_real_20261002.json`，55 个速度桶 + 55 个步频桶）：
-///
-/// - `id` **连续递增**（1628、1629、…、1682），不是按 `endSec` 跳号。
-///   旧实现用 `(rrid%100000)*1000+endSec`，同一个数组里相邻桶的 id 差 10；
-/// - 两个数组共用同一条 id 序列（速度桶和步频桶第 i 项 id 相同）；
-/// - `queueNum` 起步段（前 8 个桶）是 0，之后**每 2 个桶 +1** 到 24
-///   （`8→1、10→2、…、54→24`，55 个桶逐元素与真机一致）；
-/// - `speed_json` 的 `state`：起步段的 8 个桶是 **2**，其余 47 个是 **0**。
-///   起步段（前 86 秒）配速还没起来，App 把这几个桶标成「非正常」；
-/// - `step_freq_json` 的 `state` 恒 0。
-///
-/// 依赖提交返回的 `rrid`，所以 OBS 必须在提交**之后**上传。
-pub fn apply_obs_ids(
-    speed: &mut [SpeedBucket],
-    steps: &mut [StepBucket],
-    rrid: i64,
-    start_ms: i64,
-) {
-    // 真机 id 是服务端自增列（1628 起）。客户端只需落在同量级、且同一条
-    // 记录内连续递增，所以按 rrid + 起始时间派生一个稳定偏移。
-    let base =
-        1600 + (((rrid as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ start_ms as u64) % 400) as i64;
-    let n = speed.len().max(steps.len());
-    let total_sec = speed
-        .last()
-        .map(|b| (b.end_time - start_ms) / 1000)
-        .unwrap_or(10)
-        .max(10);
-    let su = bucket_startup(total_sec);
-    for (i, b) in speed.iter_mut().enumerate() {
-        b.id = base + i as i64;
-        b.queue_num = super::queue_num(i, n, su);
-        b.state = if i < su { 2 } else { 0 };
-    }
-    for (i, b) in steps.iter_mut().enumerate() {
-        b.id = base + i as i64;
-        b.queue_num = super::queue_num(i, n, su);
-        b.state = 0;
-    }
-}
-
-#[cfg(test)]
-mod id_tests {
-    use super::*;
+    // ---- merged from former `mod id_tests` ----
 
     #[test]
     fn submit_and_obs_ids_differ() {
@@ -504,11 +516,8 @@ mod id_tests {
         let sp = speed_buckets(&pts, 1_700_000_000_000, 10);
         assert_eq!(sp[0].flag, 1_700_000_000_000);
     }
-}
 
-#[cfg(test)]
-mod diff_not_degenerate_tests {
-    use super::*;
+    // ---- merged from former `mod diff_not_degenerate_tests` ----
 
     /// diff 三件套必须与真机一致：恒为 avgDiff=0 / maxDiff=0 / minDiff=1000。
     ///
@@ -526,11 +535,8 @@ mod diff_not_degenerate_tests {
             assert_eq!(x.avg_diff, 0, "真机 avgDiff 恒为 0");
         }
     }
-}
 
-#[cfg(test)]
-mod speed_bucket_coverage_tests {
-    use super::*;
+    // ---- merged from former `mod speed_bucket_coverage_tests` ----
 
     /// 各桶位移之和必须等于轨迹总长（重叠比例分配不该丢距离）。
     #[test]

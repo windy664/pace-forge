@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use super::client::{Client, expect_ok};
 use super::coord::gcj02_to_bd09;
 use crate::crypto::consts::hosts;
+use crate::error::{Error, ErrorKind};
 
 /// 规则接口路径。
 pub const POLICY_PATH: &str = "/api/v70103/runModePolicy";
@@ -66,10 +67,10 @@ fn get_field<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
 }
 
 /// 解析 policy 响应。
-pub fn parse_policy_response(biz: &Value) -> Result<PolicyInfo, String> {
+pub fn parse_policy_response(biz: &Value) -> Result<PolicyInfo, Error> {
     let timestamp = get_field(biz, "timestamp")
         .and_then(|t| t.as_i64())
-        .ok_or("policy 响应缺 timestamp")?;
+        .ok_or_else(|| ErrorKind::protocol("policy 响应缺 timestamp".into()))?;
     let policy = get_field(biz, "policy")
         .and_then(|t| t.as_i64())
         .unwrap_or(0);
@@ -117,7 +118,7 @@ fn parse_daily_cap(rule: &Value) -> i64 {
         if let Some(v) = rule.get(key).and_then(num_of)
             && v > 0.0
         {
-            return v.round() as i64;
+            return crate::number::round_to_i64(v).unwrap_or(0);
         }
     }
     0
@@ -151,7 +152,10 @@ pub fn daily_cap_m(client: &Client, run_mode: i64) -> (i64, String) {
 fn parse_steo_range(rule: &Value) -> Option<(i64, i64)> {
     let top = rule.get("stepTop").and_then(|v| v.as_f64())?;
     let bottom = rule.get("stepBottom").and_then(|v| v.as_f64())?;
-    let (a, b) = (bottom.round() as i64, top.round() as i64);
+    let (a, b) = (
+        crate::number::round_to_i64(bottom)?,
+        crate::number::round_to_i64(top)?,
+    );
     if a <= 0 || b <= 0 {
         return None;
     }
@@ -237,6 +241,7 @@ pub fn point_gcj(p: &Value) -> Option<(f64, f64)> {
     }
 }
 
+/// 从点位 JSON 里取 `(lat, lon)`，字段名兼容 `latitude` 等写法。
 pub fn point_xy(p: &Value) -> Option<(f64, f64)> {
     let lat = field_num(p, &["lat", "latitude"]);
     let lon = field_num(p, &["lon", "lng", "longitude"]);
@@ -259,7 +264,7 @@ fn field_num(p: &Value, keys: &[&str]) -> Option<f64> {
 /// 拉策略。
 ///
 /// body：`{"runMode":1,"ruleUpdateTime":0,"geoFenceUpdateTime":0,"selectUnid":<unid>,"operateType":0}`
-pub fn fetch_policy_for(client: &Client, run_mode: i64) -> Result<PolicyInfo, String> {
+pub fn fetch_policy_for(client: &Client, run_mode: i64) -> Result<PolicyInfo, Error> {
     let select_unid = client
         .credentials()
         .and_then(|c| c.unid.as_ref())
@@ -288,11 +293,15 @@ pub fn fetch_policy_for(client: &Client, run_mode: i64) -> Result<PolicyInfo, St
 
 /// 策略调试转储目录。
 ///
-/// **默认不落盘**（返回 `None`）：只有显式设置 `PACE_DUMP_POLICY=<目录>`
-/// 才写。策略响应里有考生身份相关字段，不该无声无息地堆进 `$HOME`；也正因为
-/// 默认关闭，跑测试不可能往真实 `$HOME` 里多写一个文件。
+/// **默认不落盘**（返回 `None`）：只有显式配置 `run.dump_policy`
+/// （env `PACE_DUMP_POLICY`）=<目录> 才写。策略响应里有考生身份相关字段，
+/// 不该无声无息地堆进 `$HOME`；也正因为默认关闭，跑测试不可能往真实
+/// `$HOME` 里多写一个文件。
 pub fn dump_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("PACE_DUMP_POLICY").map(std::path::PathBuf::from)
+    // 原文直用（不 trim）：与旧 `var_os` 语义一致
+    let cfg = crate::config::global();
+    let dir = &cfg.run.dump_policy;
+    (!dir.is_empty()).then(|| std::path::PathBuf::from(dir))
 }
 
 /// 策略转储文件路径：`<dir>/policy-runmode<runMode>.json`。
@@ -327,7 +336,7 @@ fn dump_policy_in(dir: Option<&std::path::Path>, run_mode: i64, v: &Value) {
 /// 走的是独立的 `/api/points` 接口，不依赖策略。
 pub fn fallback_policy() -> PolicyInfo {
     PolicyInfo {
-        timestamp: crate::crypto::envelope::now_ms() as i64,
+        timestamp: crate::crypto::envelope::now_ms(),
         policy: 0,
         min_distance: 1500,
         valid_time: 55_800,
@@ -380,7 +389,7 @@ pub fn in_window(now_hms: &str, start: &str, end: &str) -> bool {
 ///
 /// 依据：Nyx4 探测报告 §四.1（「每月随机核验」= 支付宝信用分，接口
 /// `creditscore/v70390/popup`，返回 `{needPopup: bool}`）。
-pub fn monthly_verify_needed(client: &Client) -> Result<bool, String> {
+pub fn monthly_verify_needed(client: &Client) -> Result<bool, Error> {
     let raw = client.request(
         "GET",
         &format!("{}/api/creditscore/v70390/popup?taskType=1", hosts::RUN),
@@ -394,13 +403,14 @@ pub fn monthly_verify_needed(client: &Client) -> Result<bool, String> {
 }
 
 /// 默认按校园跑拉策略。
-pub fn fetch_policy(client: &Client) -> Result<PolicyInfo, String> {
+pub fn fetch_policy(client: &Client) -> Result<PolicyInfo, Error> {
     fetch_policy_for(client, 1)
 }
 
 #[cfg(test)]
-mod window_tests {
+mod tests {
     use super::in_window;
+    use super::*;
 
     #[test]
     fn window_is_closed_interval() {
@@ -412,11 +422,8 @@ mod window_tests {
         assert!(!in_window("22:01:00", s, e), "晚于窗口不算");
         assert!(!in_window("03:00:00", s, e));
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    // ---- merged from former `mod tests` ----
 
     #[test]
     fn parses_daily_cap_from_real_payload() {
@@ -526,14 +533,12 @@ mod tests {
             "policy-runmode1.json"
         );
 
-        // 没有显式设置环境变量时，默认**不落盘**
-        if std::env::var_os("PACE_DUMP_POLICY").is_none() {
-            assert_eq!(
-                dump_dir(),
-                None,
-                "默认不该有转储目录，否则测试会写真实 HOME"
-            );
-        }
+        // 默认（没有任何配置来源）**不落盘**；并行的 Guard 测试只动别的键
+        assert_eq!(
+            dump_dir(),
+            None,
+            "默认不该有转储目录，否则测试会写真实 HOME"
+        );
     }
 
     /// 转储只在显式给定目录时写，且目录不存在时自己建、权限 600。
@@ -566,11 +571,8 @@ mod tests {
             "无转储目录时不该写任何文件"
         );
     }
-}
 
-#[cfg(test)]
-mod pace_range_tests {
-    use super::*;
+    // ---- merged from former `mod pace_range_tests` ----
 
     fn rule(top: Value, bottom: Value) -> Value {
         serde_json::json!({"speedTop": top, "speedBottom": bottom})
