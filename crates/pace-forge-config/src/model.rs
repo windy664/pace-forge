@@ -92,9 +92,21 @@ pub struct Run {
     /// 同上。
     pub center_lng: Option<f64>,
     /// CLI 默认试操场轨迹（web 不读这个，走自己的 mode）。
+    ///
+    /// 默认 **true**：操场模式算出来的轨迹是「按点位数组序穿过全部打卡点的
+    /// 光滑环」，首次经过次序**确定**；路线规划那条兜底路的次序取决于种子
+    /// ——实测某校 5 个点的数组序 1→4→5→2→3、环序 1→2→3→4→5，兜底路要靠
+    /// 种子凑巧才同序（凑巧时能过，凑不巧就判「按顺序通过所有点位」失败）。
+    /// 操场模式失败时本来就会自动退回路线规划，所以这里默认开是安全的。
     pub prefer_stadium: bool,
     /// 超日上限也继续提交。
     pub ignore_daily_limit: bool,
+    /// 账号已在服务端违规名单里，也继续提交。
+    ///
+    /// 默认关：名单里的记录是**过去**留下的（旧轨迹的毛病），新轨迹修好了
+    /// 之后本来值得再试一条；但「提交成功」不等于「没被标记」，所以这个
+    /// 开关必须显式开、并且把开关名打进日志，留痕。
+    pub ignore_cheat_flag: bool,
     /// 策略响应落盘目录（排障用）；空 = 不落盘。
     pub dump_policy: String,
     /// 步频回归截距（`cadence = 截距 + 斜率×v`）；None = 用内置默认 34.4。
@@ -119,8 +131,9 @@ impl Default for Run {
             cad_intercept: None,
             cad_slope: None,
             center_lng: None,
-            prefer_stadium: false,
+            prefer_stadium: true,
             ignore_daily_limit: false,
+            ignore_cheat_flag: false,
             dump_policy: String::new(),
         }
     }
@@ -268,6 +281,10 @@ impl Config {
             (
                 "run.ignore_daily_limit",
                 b(self.run.ignore_daily_limit).into(),
+            ),
+            (
+                "run.ignore_cheat_flag",
+                b(self.run.ignore_cheat_flag).into(),
             ),
             (
                 "run.dump_policy",

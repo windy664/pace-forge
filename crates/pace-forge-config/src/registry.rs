@@ -85,6 +85,11 @@ pub(crate) const TABLE: &[EntryDef] = &[
         "PACE_IGNORE_DAILY_LIMIT",
         parse_bool
     ),
+    entry!(
+        "run.ignore_cheat_flag",
+        "PACE_IGNORE_CHEAT_FLAG",
+        parse_bool
+    ),
     entry!("run.dump_policy", "PACE_DUMP_POLICY", parse_str_raw),
 ];
 

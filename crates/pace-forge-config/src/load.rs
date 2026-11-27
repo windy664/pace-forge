@@ -237,6 +237,7 @@ impl Config {
                 "run.center_lng" => cfg.run.center_lng = Some(v.as_float()),
                 "run.prefer_stadium" => cfg.run.prefer_stadium = v.as_bool(),
                 "run.ignore_daily_limit" => cfg.run.ignore_daily_limit = v.as_bool(),
+                "run.ignore_cheat_flag" => cfg.run.ignore_cheat_flag = v.as_bool(),
                 "run.dump_policy" => cfg.run.dump_policy = v.as_str().to_string(),
                 other => panic!("注册表键 {other} 在 Config::from_values 里没有落点"),
             }

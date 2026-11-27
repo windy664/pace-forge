@@ -2708,10 +2708,20 @@ pub fn run_full(
         match crate::api::cheat::query(client, 1, &mut |l| log(l)) {
             Ok(rep) => match rep.status() {
                 Status::Flagged => {
-                    return Err(ErrorKind::client(format!(
-                        "服务端已把当前账号标记为违规（{}）：先处理，别继续提交。详见 [cheat] 那几行",
-                        rep.summary()
-                    )));
+                    if crate::config::global().run.ignore_cheat_flag {
+                        // 名单里的记录是**过去**留下的（旧轨迹的毛病）。新轨迹
+                        // 修好之后本来值得再试一条 —— 但「提交成功」不等于
+                        // 「没被标记」，所以这个开关必须显式开，而且留日志。
+                        log(&format!(
+                            "! [cheat] 账号在服务端违规名单里（{}），但已设 run.ignore_cheat_flag，继续提交",
+                            rep.summary()
+                        ));
+                    } else {
+                        return Err(ErrorKind::client(format!(
+                            "服务端已把当前账号标记为违规（{}）：先处理，别继续提交。详见 [cheat] 那几行",
+                            rep.summary()
+                        )));
+                    }
                 }
                 Status::NoRecord => log("√ [cheat] 违规名单自查：当前账号无记录"),
                 s => log(&format!(
