@@ -12,6 +12,7 @@ pub mod planner;
 pub mod preflight;
 pub mod roadnet;
 pub mod simulate;
+pub mod spline;
 pub mod stadium;
 pub mod tileroad;
 
@@ -157,11 +158,18 @@ pub fn cap_advances(adv: &mut [f64], caps: &[f64], total: f64) {
 
 /// 原地压缩起步窗口：把窗口内采样点的里程压到全程的约 1.1%，
 /// 后面的点顺延补上，末点仍钉在总长。
+///
+/// `checkpoints` 是这次跑必须经过的点位（BD-09）。压缩会**重铺**采样网格，
+/// 而重铺会把网格沿路径整体平移（实测某校 3km/18min 平移最多 167m）——
+/// 打卡点的命中点因此被甩到别的圈上去，「首次经过」落到后面几圈，
+/// 服务端判「按顺序通过所有点位」直接失败。所以重铺完要把每个打卡点
+/// **钉**回网格（见 [`anchor_checkpoints`]）。
 pub fn compress_startup(
     pts: &mut [TrackPoint],
     start_ms: i64,
     total_sec: i64,
     max_step_mps: Option<f64>,
+    checkpoints: &[(f64, f64)],
 ) {
     let n = pts.len();
     if n < 4 {
@@ -263,27 +271,12 @@ pub fn compress_startup(
         cap_advances(&mut want, &caps, total_len);
     }
 
+    // 打卡点钉在网格上（见 [`anchor_checkpoints`]）：重铺会把网格沿路径平移，
+    // 打卡点的命中点被甩到别的圈 ⇒「首次经过」次序乱。
+    anchor_checkpoints(&mut want, &arc, pts, checkpoints);
+
     // 沿原折线插值（want 单调，游标只往前走）
-    let mut out = Vec::with_capacity(n);
-    let mut j = 0usize;
-    for &s in want.iter() {
-        let target = s.clamp(0.0, total_len);
-        while j + 1 < n && arc[j + 1] < target {
-            j += 1;
-        }
-        let hi = (j + 1).min(n - 1);
-        let seg = arc[hi] - arc[j];
-        let frac = if seg > 0.0 {
-            ((target - arc[j]) / seg).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let (p0, p1) = (pts[j], pts[hi]);
-        out.push((
-            p0.lat + (p1.lat - p0.lat) * frac,
-            p0.lon + (p1.lon - p0.lon) * frac,
-        ));
-    }
+    let mut out = interp_on_polyline(pts, &arc, &want, total_len);
     // 末点必须是原终点（浮点插值可能差最后一位）
     if let Some(last) = out.last_mut() {
         *last = (pts[n - 1].lat, pts[n - 1].lon);
@@ -340,33 +333,112 @@ pub fn compress_startup(
             };
             want.push(cluster + (total_len - cluster) * f);
         }
-        out.clear();
-        let mut j = 0usize;
-        for &s in want.iter() {
-            let target = s.clamp(0.0, total_len);
-            while j + 1 < n && arc[j + 1] < target {
-                j += 1;
-            }
-            let hi = (j + 1).min(n - 1);
-            let seg = arc[hi] - arc[j];
-            let frac = if seg > 0.0 {
-                ((target - arc[j]) / seg).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            let (p0, p1) = (pts[j], pts[hi]);
-            out.push((
-                p0.lat + (p1.lat - p0.lat) * frac,
-                p0.lon + (p1.lon - p0.lon) * frac,
-            ));
-        }
-        if let Some(last) = out.last_mut() {
-            *last = (pts[n - 1].lat, pts[n - 1].lon);
-        }
+        // 重新钉一次：cluster 变了，窗口内的弧长也变了。
+        anchor_checkpoints(&mut want, &arc, pts, checkpoints);
+        out = interp_on_polyline(pts, &arc, &want, total_len);
     }
     for (i, (la, lo)) in out.into_iter().enumerate() {
         pts[i].lat = la;
         pts[i].lon = lo;
+    }
+}
+
+/// 沿原折线按目标弧长插值出坐标（`want` 必须单调不减）。
+///
+/// 末点强制取原折线的末点（浮点插值可能差最后一位）。
+fn interp_on_polyline(
+    pts: &[TrackPoint],
+    arc: &[f64],
+    want: &[f64],
+    total_len: f64,
+) -> Vec<(f64, f64)> {
+    let n = pts.len();
+    let mut out = Vec::with_capacity(n);
+    let mut j = 0usize;
+    for &s in want.iter() {
+        let target = s.clamp(0.0, total_len);
+        while j + 1 < n && arc[j + 1] < target {
+            j += 1;
+        }
+        let hi = (j + 1).min(n - 1);
+        let seg = arc[hi] - arc[j];
+        let frac = if seg > 0.0 {
+            ((target - arc[j]) / seg).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let (p0, p1) = (pts[j], pts[hi]);
+        out.push((
+            p0.lat + (p1.lat - p0.lat) * frac,
+            p0.lon + (p1.lon - p0.lon) * frac,
+        ));
+    }
+    if let Some(last) = out.last_mut() {
+        *last = (pts[n - 1].lat, pts[n - 1].lon);
+    }
+    out
+}
+
+/// 把重铺后的采样网格「钉」在打卡点上。
+///
+/// 每个打卡点找重铺网格里离它最近的那个采样点，把该点的目标弧长改成打卡点
+/// 在折线上的投影弧长（落在相邻两个采样点之间）。网格因此在打卡点附近有一处
+/// 轻微的疏密调整（真机的点距本来就在 0~31m 之间晃），但**打卡点一定被命中**。
+///
+/// 不钉会怎样（实测，某校 3km/18min / 5 个打卡点）：
+///
+/// - 窗口外的重铺是仿射映射（`[anchor, total_len] → [cluster, total_len]`），
+///   整段网格沿路径**平移**，起步段平移最多 167m；
+/// - 平移之后压缩出来的路径离打卡点最远能差 19.9m —— 打卡点的命中点没了；
+/// - 服务端按 10m 半径找「首次经过」，找不到第一圈的那次，于是首次经过落到
+///   后面几圈，「按顺序通过所有点位」失败（24 个种子 4 个乱序；生产上自检
+///   直接报「#4 先于 #0 被经过」）。
+fn anchor_checkpoints(
+    want: &mut [f64],
+    arc: &[f64],
+    pts: &[TrackPoint],
+    checkpoints: &[(f64, f64)],
+) {
+    if checkpoints.is_empty() || want.len() < 3 {
+        return;
+    }
+    let xy: Vec<(f64, f64)> = pts.iter().map(|p| (p.lat, p.lon)).collect();
+    // 打卡点 → 它在折线上的投影弧长（**首次**经过的那一段）。
+    let mut items: Vec<f64> = checkpoints
+        .iter()
+        .filter_map(|cp| first_arc_on(&xy, arc, *cp, CHECKPOINT_SNAP_MAX_M))
+        .map(|(a, _)| a)
+        .collect();
+    if items.is_empty() {
+        return;
+    }
+    // 按弧长排序：先钉前面的，后面的钉点才不会把前面的挤掉。
+    items.sort_by(|a, b| a.total_cmp(b));
+    let mut taken: Vec<usize> = Vec::with_capacity(items.len());
+    for arc_cp in items {
+        let mut idx = usize::MAX;
+        let mut best = f64::INFINITY;
+        for (i, &w) in want.iter().enumerate() {
+            if taken.contains(&i) || i == 0 || i + 1 >= want.len() {
+                continue;
+            }
+            let d = (w - arc_cp).abs();
+            if d < best {
+                best = d;
+                idx = i;
+            }
+        }
+        if idx == usize::MAX {
+            continue;
+        }
+        // 钉在相邻两个采样点之间：网格的单调性不能破。
+        let lo = want[idx - 1] + MIN_SAMPLE_GAP_M;
+        let hi = want[idx + 1] - MIN_SAMPLE_GAP_M;
+        if lo >= hi {
+            continue;
+        }
+        want[idx] = arc_cp.clamp(lo, hi);
+        taken.push(idx);
     }
 }
 
@@ -545,6 +617,55 @@ pub fn nearest_arc_on(path: &[(f64, f64)], arc: &[f64], p: (f64, f64)) -> (f64, 
         }
     }
     best
+}
+
+/// 折线上**首次**经过 `p` 的位置（半径 `radius_m` 内），返回 `(弧长, 距离)`。
+///
+/// 与 [`nearest_arc_on`] 的区别在**多圈轨迹**上很要命：同一个打卡点每一圈都会
+/// 经过，「全局最近」落在哪一圈完全由 GPS 噪声决定（同一份轨迹、不同种子实测
+/// 落在不同圈）。而服务端判「按顺序通过所有点位」看的是**首次**经过的次序，
+/// 所以对齐与吸附都必须落在**首次**经过的那一圈上——落错圈，首次经过就被推到
+/// 后面几圈，次序直接乱掉（实测某校 3km/18min：24 个种子里 3 个乱序，
+/// 生产上表现为自检报「#4 先于 #0 被经过」）。
+///
+/// 半径内一次都没经过 ⇒ 返回 `None`（整条轨迹压根不经过它，交给
+/// [`crate::track::preflight`] 报 `CP_MISS`，不硬拽）。
+pub fn first_arc_on(
+    path: &[(f64, f64)],
+    arc: &[f64],
+    p: (f64, f64),
+    radius_m: f64,
+) -> Option<(f64, f64)> {
+    let n = path.len();
+    if n == 0 || arc.len() != n {
+        return None;
+    }
+    if n == 1 {
+        let d = geo::distance(path[0], p);
+        return if d < radius_m { Some((0.0, d)) } else { None };
+    }
+    // 米制平面上的投影（校园尺度足够：几十公里内误差可忽略）
+    let mlat = geo::M_PER_DEG_LAT;
+    let mlng = geo::m_per_deg_lng(p.0);
+    for i in 0..n - 1 {
+        let (a, b) = (path[i], path[i + 1]);
+        let seg = arc[i + 1] - arc[i];
+        let (ax, ay) = ((a.1 - p.1) * mlng, (a.0 - p.0) * mlat);
+        let (bx, by) = ((b.1 - p.1) * mlng, (b.0 - p.0) * mlat);
+        let (dx, dy) = (bx - ax, by - ay);
+        let len2 = dx * dx + dy * dy;
+        let t = if len2 > 1e-12 {
+            (-((ax * dx) + (ay * dy)) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let (px, py) = (ax + dx * t, ay + dy * t);
+        let d = (px * px + py * py).sqrt();
+        if d < radius_m {
+            return Some((arc[i] + seg * t, d));
+        }
+    }
+    None
 }
 
 /// 折线上弧长 `s` 处的坐标（二分定位，零长度段按起点处理）。
@@ -825,12 +946,13 @@ pub fn sample_by_time(
     // 对齐：采样点落在点位弧长上，两侧间距只被拉伸 ≤ 半个步长。
     if !checkpoints.is_empty() && n >= 3 {
         for &cp in checkpoints {
-            let target = nearest_arc_on(path, &arc, cp);
-            // 只对齐「轨迹确实经过它」的情况：折线最近点离点位太远时不动，
-            // 留给 preflight 报 CP_MISS（硬拽过去等于伪造）
-            if target.1 > CHECKPOINT_SNAP_MAX_M {
+            // **首次**经过的那一段，不是全局最近的那一段：多圈轨迹上同一个
+            // 打卡点每圈都经过，全局最近落在哪一圈由 GPS 噪声决定（详见
+            // [`first_arc_on`]）。对齐错了圈，服务端看到的首次经过次序就乱。
+            let Some(target) = first_arc_on(path, &arc, cp, CHECKPOINT_SNAP_MAX_M) else {
+                // 轨迹压根没经过它：不动，让 preflight 如实报 CP_MISS
                 continue;
-            }
+            };
             let mut idx = 0usize;
             let mut best = f64::INFINITY;
             for (i, &x) in s.iter().enumerate() {
@@ -987,11 +1109,18 @@ pub fn align_samples_to_checkpoints(pts: &mut [TrackPoint], cps: &[(f64, f64)]) 
     let mut done = 0usize;
     let mut taken: Vec<usize> = Vec::with_capacity(cps.len());
     for &cp in cps {
-        let (arc_cp, dist_cp) = nearest_arc_on(&xy, &arc, cp);
-        // 轨迹压根没经过它：不动，让 preflight 如实报 CP_MISS
-        if dist_cp > CHECKPOINT_SNAP_MAX_M {
+        // **首次**经过的那一段（不是全局最近）：多圈轨迹上全局最近落在哪一圈
+        // 由 GPS 噪声决定，落到后面几圈就等于把「首次经过」推后 ⇒ 顺序乱。
+        //
+        // 半径取**服务端的命中半径**（`FIXED_POINT_HIT_M` = 10m）：服务端判
+        // 「经过」就是这个半径，压缩出来的起步小碎段有时会从 15~20m 外擦过
+        // 打卡点，那种「擦过」不算经过，用它当锚点会把锚点钉到碎段上。
+        let Some((arc_cp, _dist_cp)) =
+            first_arc_on(&xy, &arc, cp, crate::api::submit::FIXED_POINT_HIT_M)
+        else {
+            // 轨迹压根没经过它：不动，让 preflight 如实报 CP_MISS
             continue;
-        }
+        };
         let mut idx = usize::MAX;
         let mut best = f64::INFINITY;
         for (i, &a) in arc.iter().enumerate() {
@@ -1781,7 +1910,7 @@ mod tests {
             (cadence_stats(&track).mean_dt_sec - REAL_MEAN_INTERVAL_SEC).abs() < 0.2,
             "A1 扫的必须是真机节奏"
         );
-        compress_startup(&mut track, START_MS, dur, None);
+        compress_startup(&mut track, START_MS, dur, None, &[]);
         align_samples_to_checkpoints(&mut track, cps);
         let rep = if snap {
             snap_checkpoints(&mut track, cps)
@@ -2002,7 +2131,7 @@ mod tests {
             &[],
             cps,
         );
-        compress_startup(&mut track, START_MS, dur, None);
+        compress_startup(&mut track, START_MS, dur, None, &[]);
         align_samples_to_checkpoints(&mut track, cps);
         let rep = if snap {
             snap_checkpoints(&mut track, cps)
@@ -2426,7 +2555,7 @@ mod tests {
             &[],
         );
         assert!(track.len() >= 2, "采样为空");
-        compress_startup(&mut track, START_MS_SAMPLE_RATE_TESTS, 555, None);
+        compress_startup(&mut track, START_MS_SAMPLE_RATE_TESTS, 555, None, &[]);
         let st = cadence_stats(&track);
         (track, st)
     }
@@ -2654,7 +2783,7 @@ mod tests {
             .map(|w| geo::distance((w[0].lat, w[0].lon), (w[1].lat, w[1].lon)))
             .collect();
         let mut after = raw.clone();
-        compress_startup(&mut after, START_MS_SAMPLE_RATE_TESTS, 555, None);
+        compress_startup(&mut after, START_MS_SAMPLE_RATE_TESTS, 555, None, &[]);
         let d_after: Vec<f64> = after
             .windows(2)
             .map(|w| geo::distance((w[0].lat, w[0].lon), (w[1].lat, w[1].lon)))
@@ -2757,7 +2886,7 @@ mod tests {
             })
             .collect();
         // 不 panic 即为通过；压完还要保住首末点与时长
-        compress_startup(&mut pts, START_MS_SAMPLE_RATE_TESTS, 555, None);
+        compress_startup(&mut pts, START_MS_SAMPLE_RATE_TESTS, 555, None, &[]);
         assert_eq!(pts.len(), n);
         assert_eq!(pts.first().unwrap().time_ms, START_MS_SAMPLE_RATE_TESTS);
         assert_eq!(
@@ -2825,7 +2954,7 @@ mod tests {
             .windows(2)
             .map(|w| geo::distance((w[0].lat, w[0].lon), (w[1].lat, w[1].lon)))
             .sum::<f64>();
-        compress_startup(&mut pts, START_MS_SAMPLE_RATE_TESTS, 555, Some(4.76));
+        compress_startup(&mut pts, START_MS_SAMPLE_RATE_TESTS, 555, Some(4.76), &[]);
         // 起步窗口（前 startup_point_count 个点）弧长被压平是设计行为，只查窗口外
         let su = startup_point_count(
             &pts.iter().map(|p| p.time_ms).collect::<Vec<_>>(),

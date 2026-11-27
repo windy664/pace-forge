@@ -940,11 +940,15 @@ pub fn route_through_in_order(
     };
 
     let mut points: Vec<(f64, f64)> = vec![must[0]];
-    let legs = must.len() - 1;
+    // 必经点按顺序串成**一个闭环**（末点回到首点）：补里程时绕这个圈跑，
+    // 每圈都按同样的顺序再过一遍这些点（顺序闸只看首次经过）。
+    let mut closed: Vec<(f64, f64)> = must.to_vec();
+    closed.push(must[0]);
+    let legs = closed.len() - 1;
 
     // 先按顺序把点串起来，每段用一条鼓出的弧
     for i in 0..legs {
-        let (a, b) = (must[i], must[i + 1]);
+        let (a, b) = (closed[i], closed[i + 1]);
         let d = distance(a, b);
         if d < 1.0 {
             points.push(b);
@@ -983,7 +987,13 @@ pub fn route_through_in_order(
         // 真实打卡点里 P1 和 P4 只隔 106m，第一段弧鼓出来就会从 P4 边上过，
         // 服务端按「按顺序通过所有点位」判定时会认为 P4 提前通过了，
         // 后面的顺序全乱。检测到就反向弯曲（换另一侧），仍冲突就压平。
-        let later: Vec<(f64, f64)> = must[i + 2..].to_vec();
+        // 「后续点位」= 闭环里排在它后面的点；末尾那个重复的起点不算
+        // （否则第一段弧会被迫绕开起点自己）。
+        let later: Vec<(f64, f64)> = if i + 2 < closed.len() - 1 {
+            closed[i + 2..closed.len() - 1].to_vec()
+        } else {
+            Vec::new()
+        };
         let grazes = |c: (f64, f64)| -> bool {
             // 沿曲线采样看有没有蹭到后续点位
             for k in 1..12 {
@@ -1057,53 +1067,71 @@ pub fn route_through_in_order(
         }
     }
 
-    // 里程还不够：在最后一点附近绕小圈补足
+    // 里程还不够：**绕这个闭环跑圈**补足。
+    //
+    // 原来是「在最后一点附近绕半径 45~85m 的小圈」。实测（2026-11-27，3km 目标、
+    // 学校围栏 497×472m）：串完 5 个打卡点只有约 0.5km，剩下的 2.5km 全是小圈
+    // 补的 —— 地图上是一团乱圈，绕行倍率 15.8×、转角 >25° 有 27 处。
+    //
+    // 真人跑完打卡点之后是**继续绕场地跑圈**：这里就绕着闭环跑，每圈按同样的
+    // 顺序再过一遍这些点（顺序闸只看首次经过）。
     let mut total = path_len(&points);
     let mut guard = 0;
     // 总长一旦超过目标的 3 倍就停，防止补里程循环失控
     let hard_cap = want_m * 3.0 + 1000.0;
-    // 补到「目标 - 容差」就收工。硬凑整会把最后几百米变成几个原地小圈，
-    // 既不自然又容易穿楼；服务端只看点位顺序和最低里程，差 300 m 照收。
+    // 补到「目标 - 容差」就收工。服务端只看点位顺序和最低里程，差 300 m 照收。
     let stop_at = (want_m - super::geo::length_tolerance(want_m)).max(want_m * 0.7);
-    while total < stop_at && guard < 200 && total < hard_cap {
-        guard += 1;
-        #[expect(
-            clippy::unwrap_used,
-            reason = "non-empty is guaranteed by the guard above"
-        )]
-        let anchor = *points.last().unwrap();
-        // 绕圈半径 40~90m，圈心朝围栏中心
-        let cx = fence.iter().map(|p| p.0).sum::<f64>() / fence.len() as f64;
-        let cy = fence.iter().map(|p| p.1).sum::<f64>() / fence.len() as f64;
-        let dir = (cx - anchor.0, cy - anchor.1);
-        let dl = (dir.0 * dir.0 + dir.1 * dir.1).sqrt();
-        let r = 45.0 + (next() % 400) as f64 / 10.0;
-        let mlat = m_per_deg_lat(anchor.0).max(1.0);
-        let mlng = m_per_deg_lng(anchor.0).max(1.0);
-        let (dy, dx) = if dl > 1e-9 {
-            (dir.0 / dl, dir.1 / dl)
-        } else {
-            (1.0, 0.0)
-        };
-        let center = (anchor.0 + dy * r / mlat, anchor.1 + dx * r / mlng);
-        let segments = 40;
-        for k in 1..=segments {
-            let th = std::f64::consts::TAU * k as f64 / segments as f64;
-            let p = (
-                center.0 + r * th.cos() / mlat,
-                center.1 + r * th.sin() / mlng,
-            );
-            if contains(fence, p.0, p.1) {
+    let lap_pts = points.clone();
+    let lap_len = path_len(&lap_pts);
+    if lap_len >= 20.0 {
+        let cx = lap_pts.iter().map(|p| p.0).sum::<f64>() / lap_pts.len() as f64;
+        let cy = lap_pts.iter().map(|p| p.1).sum::<f64>() / lap_pts.len() as f64;
+        let mlat = m_per_deg_lat(cx).max(1.0);
+        let mlng = m_per_deg_lng(cy).max(1.0);
+        let mut lap = 0usize;
+        while total < stop_at && guard < 200 && total < hard_cap {
+            guard += 1;
+            // 圈与圈之间横向挪几米（真人换道），免得完全重合。
+            let off = (lap % 2) as f64 * 3.0;
+            for &q in &lap_pts {
+                let p = if off > 0.0 {
+                    let dx = (q.0 - cx) / mlat;
+                    let dy = (q.1 - cy) / mlng;
+                    let d = (dx * dx + dy * dy).sqrt().max(1e-9);
+                    (q.0 + (dx / d) * off / mlat, q.1 + (dy / d) * off / mlng)
+                } else {
+                    q
+                };
+                if !contains(fence, p.0, p.1) {
+                    continue;
+                }
                 total += distance(*points.last().unwrap(), p);
                 points.push(p);
-                if total >= want_m {
+                if total >= stop_at {
                     break;
                 }
             }
+            lap += 1;
         }
     }
 
     let length_m = path_len(&points);
+    if std::env::var("PACE_DEBUG_ORDER").is_ok() {
+        eprintln!("[debug] 路线点数 {} 长 {:.0}m", points.len(), length_m);
+        for (i, m) in must.iter().enumerate() {
+            let hits: Vec<usize> = points
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| distance(**p, *m) < 5.0)
+                .map(|(j, _)| j)
+                .collect();
+            eprintln!(
+                "[debug] 打卡点{}: 命中下标 {:?}",
+                i,
+                &hits[..hits.len().min(8)]
+            );
+        }
+    }
     Ok(FenceRoute {
         points,
         length_m,
@@ -1150,11 +1178,32 @@ pub fn pin_checkpoints_in_order(
     let mut from = 0usize;
     let mut dists = Vec::with_capacity(must.len());
     for &m in must {
-        let (best_i, best_d) = nearest_segment(&out, from.min(out.len().saturating_sub(2)), m);
-        out.insert(best_i + 1, m);
+        // 找**顶点**里离它最近的那个（只找 `from` 之后的，保证次序单调）。
+        //
+        // 原来这里是「找最近的线段 → 把点位插进去」。路径本来就从点位上
+        // 穿过时，插入等于**复制一个顶点**：相邻两点重合 ⇒ 那一处的转角
+        // 算出来是 180°。实测 5 个打卡点处各有一处 >130° 的尖刺
+        // （最大 152°），地图上就是几个尖刺。
+        //
+        // 现在改成「把最近的顶点挪到点位上，邻域按 1/(k+1) 跟着挪」：
+        // 路径照样精确经过点位，但没有重复顶点，位移摊在 5 个点上就是
+        // 一段平缓的弯。
+        let start = from.min(out.len().saturating_sub(1));
+        let mut bi = start;
+        let mut bd = f64::MAX;
+        for (i, p) in out.iter().enumerate().skip(start) {
+            let d = crate::track::geo::distance(*p, m);
+            if d < bd {
+                bd = d;
+                bi = i;
+            }
+        }
+        if bd > 1e-3 {
+            crate::track::geo::nudge_to(&mut out, bi, m, 2);
+        }
         // 下一段从刚钉进去的点开始找：这样后面的点只可能钉得更晚
-        from = best_i + 1;
-        dists.push(best_d);
+        from = bi.saturating_add(1);
+        dists.push(bd);
     }
     (out, dists)
 }

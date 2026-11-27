@@ -122,6 +122,7 @@ fn should_try_stadium(run_mode: i64, prefer_stadium: bool) -> bool {
 
 fn try_stadium_track(
     cps: &[Checkpoint],
+    fence: &[(f64, f64)],
     distance_m: f64,
     sample_step_m: f64,
     seed: u64,
@@ -227,9 +228,13 @@ fn try_stadium_track(
     // 里程缩水 11.6%（实测 2000m 只跑出 1768m），地图上是一堆尖刺。
     if aspect < 1.5 {
         log(&format!(
-            "[track] 打卡点外框 {major:.0}×{minor:.0}m（长宽比 {aspect:.1}）太圆，不像环形跑道，改用路线规划"
+            "[track] 打卡点外框 {major:.0}×{minor:.0}m（长宽比 {aspect:.1}）太圆，不像环形跑道"
         ));
-        return None;
+        // 不退回路线规划：那条路是「折线 + 每段一条鼓出弧」，在图上是一团
+        // 交叠的乱线（实测上报尺度上 >25° 的急转 41 处、>60° 24 处、最大 152°）。
+        // 改走「按点位数组序穿过全部打卡点的闭合样条环」——同样是绕圈，
+        // 但穿过点位、且全程光滑。
+        return stadium_loop_track(cps, fence, distance_m, sample_step_m, seed, log);
     }
 
     // 先认标准跑道。
@@ -338,28 +343,113 @@ fn try_stadium_track(
         ));
     }
     if !stadium_cp_fits(&pts, cps, log) {
-        return None;
+        return stadium_loop_track(cps, fence, distance_m, sample_step_m, seed, log);
+    }
+    // 椭圆绕圈的首次经过序 = 点位在环上的**环序**。服务端判「按顺序通过
+    // 所有点位」用的是**它自己下发的点位数组序**，两套顺序不一致的场子，
+    // 椭圆绕圈不管往哪转都是乱序（实测某校数组序 1→4→5→2→3，环序
+    // 1→2→3→4→5）。这种场子椭圆根本满足不了「按顺序通过所有点位」，
+    // 改走样条环（按数组序穿过全部点位）。
+    if !stadium_point_order_ok(&pts, cps, STADIUM_ORDER_RADIUS_OVAL_M, log) {
+        return stadium_loop_track(cps, fence, distance_m, sample_step_m, seed, log);
     }
     Some(pts)
 }
+
+/// 操场模式（续）：**按服务端点位数组序**穿过全部打卡点的闭合样条环。
+///
+/// 椭圆绕圈只能按「点位在环上的环序」经过打卡点，而服务端判「按顺序通过
+/// 所有点位」用的是**它自己下发的数组序**。两套顺序不一致的场子（实测某校
+/// 数组序 1→4→5→2→3、环序 1→2→3→4→5），椭圆绕圈必然被判乱序，操场模式
+/// 只能退回路线规划——而路线规划是「折线 + 每段一条鼓出弧」，在图上是一团
+/// 交叠的乱线。
+///
+/// 这里换一条曲线：**闭合 Hermite 环**穿过全部点位，点位按数组序排列。于是
+///
+/// - 首次经过序**天然**等于数组序（顺序闸自动通过）；
+/// - 点位**精确**命中（插值节点，不用事后吸附，轨迹不会「凹向点位」）；
+/// - 全程光滑（Hermite 在节点处切向连续，没有折角，也没有被重复插点
+///   造出来的 180° 尖刺）。
+fn stadium_loop_track(
+    cps: &[Checkpoint],
+    fence: &[(f64, f64)],
+    distance_m: f64,
+    sample_step_m: f64,
+    seed: u64,
+    log: &mut Log,
+) -> Option<Vec<(f64, f64)>> {
+    if cps.len() < 3 {
+        return None;
+    }
+    let pts: Vec<(f64, f64)> = cps.iter().map(|c| (c.lat, c.lng)).collect();
+    let tr = crate::track::spline::lap_track_through(&pts, distance_m, sample_step_m, seed);
+    if tr.len() < 3 {
+        return None;
+    }
+    // 围栏内：环会摆动，摆出围栏的那条轨迹会被服务端判越界（整条作废）。
+    if !fence.is_empty() {
+        let out: Vec<usize> = tr
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !crate::track::fence_route::contains(fence, p.0, p.1))
+            .map(|(i, _)| i)
+            .collect();
+        if !out.is_empty() {
+            log(&format!(
+                "[track] 样条环有 {} 个点落在围栏外（首个在第 {} 个），改用路线规划",
+                out.len(),
+                out[0]
+            ));
+            return None;
+        }
+    }
+    if !stadium_point_order_ok(&tr, cps, STADIUM_ORDER_RADIUS_LOOP_M, log) {
+        return None;
+    }
+    log(&format!(
+        "[track] 操场绕圈（按点位数组序的样条环）：{} 点，{:.0}m",
+        tr.len(),
+        crate::track::geo::path_length(&tr)
+    ));
+    Some(tr)
+}
+
+/// 椭圆分支的「首次经过」半径（米）：角点天然贴在跑道外 ≤16m。
+const STADIUM_ORDER_RADIUS_OVAL_M: f64 = 20.0;
+
+/// 样条环分支的「首次经过」半径（米）：环精确穿过点位，只有 GPS 噪声的
+/// ±2m 偏差；与报文层的命中口径 `FIXED_POINT_HIT_M` 一致。
+const STADIUM_ORDER_RADIUS_LOOP_M: f64 = 10.0;
 
 /// 操场轨迹的「点位首次经过顺序」闸（issue #37，与长宽比闸并列，在 plan 层调用）。
 ///
 /// 服务端「按顺序通过所有点位」是从轨迹里找每个点首次被经过的位置，再检查该
 /// 序列与点位数组同序。绕圈轨迹每圈重复经过全部点，若数组序与绕圈方向不一致
 /// （如 123×86 外框 5 点），首次经过序必然乱 → 回退按序串点。
-/// 半径取 20m：操场四角点天然贴在跑道外 ≤16m，10m 会误杀真操场。
-fn stadium_point_order_ok(pts: &[(f64, f64)], cps: &[Checkpoint], log: &mut Log) -> bool {
+///
+/// `radius_m` = 「多近算经过」。
+///
+/// - **椭圆**：20m。操场四角点天然贴在跑道外 ≤16m，10m 会误杀真操场。
+/// - **样条环**：10m。环是**精确穿过**点位的（插值节点），只有 GPS 噪声
+///   （±2m）带来的偏差；而环的起点那一段会从还没轮到的点位旁边 16m 处擦过
+///   ——按 20m 算就成「提前经过」，顺序闸必拒（实测首次经过序变成
+///   #3→#0→#1→#2→#4）。10m 与报文层的命中口径 `FIXED_POINT_HIT_M` 一致。
+fn stadium_point_order_ok(
+    pts: &[(f64, f64)],
+    cps: &[Checkpoint],
+    radius_m: f64,
+    log: &mut Log,
+) -> bool {
     let mut seen: Vec<(usize, usize)> = Vec::new();
     for (i, c) in cps.iter().enumerate() {
         match pts
             .iter()
-            .position(|q| crate::track::geo::distance(*q, (c.lat, c.lng)) < 20.0)
+            .position(|q| crate::track::geo::distance(*q, (c.lat, c.lng)) < radius_m)
         {
             Some(idx) => seen.push((i, idx)),
             None => {
                 log(&format!(
-                    "[track] 操场轨迹没有 20m 内经过打卡点 #{i}，改用路线规划"
+                    "[track] 操场轨迹没有 {radius_m:.0}m 内经过打卡点 #{i}，改用路线规划"
                 ));
                 return false;
             }
@@ -371,7 +461,7 @@ fn stadium_point_order_ok(pts: &[(f64, f64)], cps: &[Checkpoint], log: &mut Log)
     }
     let seq: Vec<String> = seen.iter().map(|x| format!("#{}", x.0)).collect();
     log(&format!(
-        "[track] 操场绕圈首次经过顺序（{}）与点位数组不同序，改用路线规划",
+        "[track] 操场绕圈首次经过顺序（{}）与点位数组不同序",
         seq.join("→")
     ));
     false
@@ -401,7 +491,7 @@ fn stadium_cp_fits(pts: &[(f64, f64)], cps: &[Checkpoint], log: &mut Log) -> boo
         log(&format!(
             "[track] ⚠ 打卡点「{name}」距操场轨迹 {d:.0}m，超过吸附上限 45m，绕圈不会经过它；",
         ));
-        log("[track] ⚠ 计分跑会被判漏打卡，操场形状放弃，改走路线规划（会逐一经过打卡点）");
+        log("[track] ⚠ 计分跑会被判漏打卡，操场形状放弃，改走按序样条环（会逐一经过打卡点）");
         return false;
     }
     log(&format!("[track] 打卡点贴合：距轨迹最远 {max_d:.1}m"));
@@ -1044,9 +1134,9 @@ fn plan_stage(
         None
     } else if want_stadium {
         let seed0 = if p.seed != 0 { p.seed } else { start_ms as u64 };
-        // issue #37：长宽比闸放行后再过「首次经过顺序」闸，不同序回退路网。
-        let got = try_stadium_track(&cps, p.distance_m, p.sample_step_m, seed0, log)
-            .filter(|pts| stadium_point_order_ok(pts, &cps, log));
+        // 顺序闸已经下沉到 try_stadium_track 的两个分支里（椭圆用 20m、
+        // 样条环用 10m，半径不同），这里不再用统一半径复查一遍。
+        let got = try_stadium_track(&cps, &fence_ring, p.distance_m, p.sample_step_m, seed0, log);
         stadium_fallback = got.is_none();
         got
     } else {
@@ -1617,7 +1707,13 @@ fn sample_stage(
     // 顺序很关键：retime 必须看**压平前**的几何（它是按路径长度分配时间的，
     // 看压平后的点会把时间也一起压没），所以压平放在 retime 之后。
     let snap_cps: Vec<(f64, f64)> = cps.iter().map(|c| (c.lat, c.lng)).collect();
-    crate::track::compress_startup(&mut track_points, start_ms, p.duration_sec, Some(v_ceil));
+    crate::track::compress_startup(
+        &mut track_points,
+        start_ms,
+        p.duration_sec,
+        Some(v_ceil),
+        &snap_cps,
+    );
 
     // ⑤.5 压缩之后沿轨迹**重新对齐一次**采样点。
     //
@@ -3519,7 +3615,7 @@ mod tests {
         let logs: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
         let l2 = std::rc::Rc::clone(&logs);
         let mut log = move |s: &str| l2.borrow_mut().push(s.to_string());
-        let r = try_stadium_track(&cps, 2000.0, 10.0, 42, &mut log);
+        let r = try_stadium_track(&cps, &[], 2000.0, 10.0, 42, &mut log);
         drop(log);
         assert!(r.is_some(), "标准 400m 外框该认成操场");
 
@@ -3569,7 +3665,7 @@ mod tests {
         let logs: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
         let l2 = std::rc::Rc::clone(&logs);
         let mut log = move |s: &str| l2.borrow_mut().push(s.to_string());
-        let r = try_stadium_track(&cps, 2000.0, 10.0, 42, &mut log);
+        let r = try_stadium_track(&cps, &[], 2000.0, 10.0, 42, &mut log);
         drop(log);
 
         let pts = r.expect("100×60m 的四角应该识别成操场");
@@ -3613,7 +3709,7 @@ mod tests {
         let logs: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
         let l2 = std::rc::Rc::clone(&logs);
         let mut log = move |s: &str| l2.borrow_mut().push(s.to_string());
-        let r = try_stadium_track(&cps, 2000.0, 10.0, 42, &mut log);
+        let r = try_stadium_track(&cps, &[], 2000.0, 10.0, 42, &mut log);
         drop(log);
         assert!(r.is_none(), "500m 跨度的打卡点不该识别成操场");
         let got = logs.borrow();
@@ -3650,7 +3746,7 @@ mod tests {
         let logs: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
         let l2 = std::rc::Rc::clone(&logs);
         let mut log = move |s: &str| l2.borrow_mut().push(s.to_string());
-        let r = try_stadium_track(&cps, 2000.0, 10.0, 42, &mut log);
+        let r = try_stadium_track(&cps, &[], 2000.0, 10.0, 42, &mut log);
         drop(log);
         let pts = r.expect("内场有一个点位也该生成操场轨迹（吸附过去）");
         let got = logs.borrow();
@@ -4059,7 +4155,7 @@ mod tests {
             "夹具的节奏必须是真机的 4.91s/点，实际 {:.2}s",
             st.mean_dt_sec
         );
-        crate::track::compress_startup(&mut track, START_MS, DURATION_SEC, None);
+        crate::track::compress_startup(&mut track, START_MS, DURATION_SEC, None, &[]);
 
         // 5 个打卡点直接取轨迹顶点，保证「轨迹真的经过它们」（isPass=true）。
         let n = track.len();
@@ -4423,24 +4519,38 @@ mod tests {
         let cps = vec![cp_at(0.0), cp_at(180.0), cp_at(90.0), cp_at(270.0)];
         let mut log = |_s: &str| {};
         assert!(
-            !stadium_point_order_ok(&pts, &cps, &mut log),
+            !stadium_point_order_ok(&pts, &cps, STADIUM_ORDER_RADIUS_OVAL_M, &mut log),
             "不同序必须回退"
         );
     }
 
-    /// issue #37 补：外框「太圆」（长宽比 < 1.7）⇒ 不按跑道拟合，回退路线规划。
+    /// issue #37 补：外框「太圆」（长宽比 < 1.7）⇒ 不按跑道拟合。
     ///
     /// 实测某校点位外框 130.8×93.5（长宽比 1.40）：短轴几乎等于标准跑道的
     /// 92.5，长轴却短 26% —— 两头没有直道，不是跑道。以前会被「小场拟合」
     /// 擦边命中（两个容差各自差一点），按半径 26m 生成 ⇒ 3 个打卡点落到圈外
     /// 16~20m ⇒ 硬吸附出凹痕 ⇒ 里程缩水 11.6%。
+    ///
+    /// 现在它也不该**退回路线规划**（那条路在图上是一团交叠的乱线），而是
+    /// 改走「按点位数组序穿过全部打卡点的闭合样条环」。
     #[test]
     fn too_round_frame_is_not_fitted_as_a_track() {
         let cps = rounded_rect_points(130.8, 93.5);
         let mut log = |_s: &str| {};
+        let pts = try_stadium_track(&cps, &[], 2000.0, 5.0, 7, &mut log)
+            .expect("太圆的外框不该按跑道拟合，但也不该退回路线规划，应改走样条环");
+        for c in &cps {
+            let best = pts
+                .iter()
+                .map(|q| crate::track::geo::distance(*q, (c.lat, c.lng)))
+                .fold(f64::MAX, f64::min);
+            // GPS 噪声（真机同款）会让点位差个 1~2m，报告层还会再吸附一次。
+            assert!(best < 3.0, "点位应被命中，残距 {best:.2}m");
+        }
+        let mut log2 = |_s: &str| {};
         assert!(
-            try_stadium_track(&cps, 2000.0, 5.0, 7, &mut log).is_none(),
-            "太圆的外框不该按跑道拟合"
+            stadium_point_order_ok(&pts, &cps, STADIUM_ORDER_RADIUS_LOOP_M, &mut log2),
+            "样条环的首次经过序必须与点位数组序一致"
         );
     }
 
@@ -4450,7 +4560,7 @@ mod tests {
         let cps = rounded_rect_points(177.0, 92.5);
         let mut log = |_s: &str| {};
         assert!(
-            try_stadium_track(&cps, 2000.0, 5.0, 7, &mut log).is_some(),
+            try_stadium_track(&cps, &[], 2000.0, 5.0, 7, &mut log).is_some(),
             "标准跑道外框不该被新判据拦掉"
         );
     }
@@ -4461,7 +4571,7 @@ mod tests {
         let cps = rounded_rect_points(160.0, 75.0);
         let mut log = |_s: &str| {};
         assert!(
-            try_stadium_track(&cps, 2000.0, 5.0, 7, &mut log).is_some(),
+            try_stadium_track(&cps, &[], 2000.0, 5.0, 7, &mut log).is_some(),
             "小场外框不该被新判据拦掉"
         );
     }
@@ -4472,6 +4582,9 @@ mod tests {
         let pts = circle_pts();
         let cps = vec![cp_at(0.0), cp_at(90.0), cp_at(180.0), cp_at(270.0)];
         let mut log = |_s: &str| {};
-        assert!(stadium_point_order_ok(&pts, &cps, &mut log), "同序应放行");
+        assert!(
+            stadium_point_order_ok(&pts, &cps, STADIUM_ORDER_RADIUS_OVAL_M, &mut log),
+            "同序应放行"
+        );
     }
 }

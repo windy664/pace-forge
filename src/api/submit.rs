@@ -4623,7 +4623,7 @@ mod tests {
             .collect();
 
         // ③ 起步窗口压平
-        compress_startup(&mut track, start, dur, None);
+        compress_startup(&mut track, start, dur, None, &[]);
         let real_len =
             path_length(&track.iter().map(|q| (q.lat, q.lon)).collect::<Vec<_>>()).round() as i64;
 
