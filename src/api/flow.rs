@@ -456,6 +456,26 @@ fn stadium_point_order_ok(
         }
     }
     seen.sort_by_key(|x| x.1);
+    // **同一下标**：两个点位被**同一个采样点**命中（相距 < radius_m）⇒
+    // 服务端给它们算出同一个「经过位置」⇒ 经过位置序列不严格递增 ⇒
+    // 「按顺序通过所有点位」照样会挂。可下面的顺序检查按数组序排完
+    // 看不见这个问题（相同下标按数组序稳定排列 ⇒ 不算逆序）⇒ 必须单报。
+    //
+    // 只报不改：轨迹形状归几何层管（起步里程预算把挨得太近的两个点位
+    // 拉开），这里硬拒只会把形状问题换成路线规划那条乱线。
+    let mut dup: Vec<String> = Vec::new();
+    for w in seen.windows(2) {
+        if w[0].1 == w[1].1 {
+            dup.push(format!("#{} 与 #{}", w[0].0, w[1].0));
+        }
+    }
+    if !dup.is_empty() {
+        log(&format!(
+            "[point-order] 操场轨迹有 {} 组点位落在同一个采样点上（{}）⇒ 服务端的「经过位置」序列不严格递增 ⇒「按顺序通过所有点位」会挂",
+            dup.len(),
+            dup.join("；")
+        ));
+    }
     if seen.windows(2).all(|w| w[1].0 > w[0].0) {
         return true;
     }
@@ -2122,6 +2142,15 @@ fn warn_point_order(order_seen: &[(usize, i64, String)], log: &mut Log) {
     // 实测踩过的坑：从 #0 到 #1 的那段路径向外扩得太远，中途擦过了 #4。
     // 轨迹实际经过顺序变成 0,4,1,2,3,4,0，服务端直接判 false，而日志里
     // 五个点位距离全是 0.1m、detect 满分区 100%，看起来毫无问题。
+    //
+    // **证据等级**（别把这条当成铁律）：
+    // - 「乱序 ⇒ type=9 失败」在**配了这条规则**的学校有实测（我们自己的
+    //   真机提交，type=9 判 false；改回同序后同一账号 type=9 过）。
+    // - 但「自检全绿 ⇒ type=9 必过」**不成立**：上游 `TYPE9-NOTES.md`
+    //   记着「逐段避让后续点位、连续 5 次规划全绿 ⇒ type=9 仍 false」。
+    //   所以自检只是**必要条件**，绿灯不等于服务端会判过。
+    // - 没配「按顺序通过所有点位」的学校不适用这条（不同学校的 `reasonList`
+    //   条目数都不一样）。
     if order_seen.len() >= 2 {
         let mut sorted = order_seen.to_vec();
         sorted.sort_by_key(|x| x.1);
@@ -2131,6 +2160,20 @@ fn warn_point_order(order_seen: &[(usize, i64, String)], log: &mut Log) {
             // w[0] 是索引更小的那个，所以是它抢在了 w[1] 前面
             .map(|w| format!("#{} {} 先于 #{} {} 被经过", w[0].0, w[0].2, w[1].0, w[1].2))
             .collect();
+        // **同一下标**：两个点位被**同一个采样点**命中（它们相距 < 命中半径）。
+        // 服务端给每个点位算一个「经过位置」，两个点位算出同一个位置 ⇒
+        // 经过位置序列不严格递增 ⇒ type=9 同样会挂。
+        // 而顺序检查按数组序排完看不见它（相同下标按数组序稳定排列 ⇒
+        // 不算逆序）⇒ 只报「顺序正确」等于自检给自己开绿灯 ⇒ 单报一条。
+        let mut dup: Vec<String> = Vec::new();
+        for w in sorted.windows(2) {
+            if w[0].1 == w[1].1 {
+                dup.push(format!(
+                    "#{} {} 与 #{} {}（都在下标 {}）",
+                    w[0].0, w[0].2, w[1].0, w[1].2, w[0].1
+                ));
+            }
+        }
         if bad.is_empty() {
             let seq: Vec<String> = sorted.iter().map(|x| format!("#{}@{}", x.0, x.1)).collect();
             log(&format!("[point-order] 顺序正确：{}", seq.join(" → ")));
@@ -2140,16 +2183,23 @@ fn warn_point_order(order_seen: &[(usize, i64, String)], log: &mut Log) {
             // 必经点（PACE_FORCE_NORMAL_POINT=0）才需要它。
             if crate::api::submit::force_normal_point() {
                 log(&format!(
-                    "[point-order] 顺序乱了（{}），但点位全部按普通点发出，服务端不判顺序——可以提交",
+                    "[point-order] 顺序乱了（{}），但点位全部按普通点发出（本地推断：服务端没收到必经点 ⇒「按顺序通过所有点位」多半不适用）——可以提交",
                     bad.join("；")
                 ));
             } else {
                 log(&format!(
-                    "[point-order] 顺序错误，服务端会判「按顺序通过所有点位」失败：{}",
+                    "[point-order] 顺序错误：{}（本地推断，有本校 type=9 实测支持：服务端会判「按顺序通过所有点位」失败）",
                     bad.join("；")
                 ));
                 log("[point-order] 重新规划或调整手绘轨迹，让轨迹只按点位次序穿过每个点");
             }
+        }
+        if !dup.is_empty() {
+            log(&format!(
+                "[point-order] ⚠ 有 {} 组点位落在同一个采样点上：{} ⇒ 服务端给它们算出同一个「经过位置」⇒ 经过位置序列不严格递增 ⇒ type=9 会挂（顺序检查看不出这种形态）",
+                dup.len(),
+                dup.join("；")
+            ));
         }
     }
 }
@@ -4602,6 +4652,79 @@ mod tests {
         assert!(
             stadium_point_order_ok(&pts, &cps, STADIUM_ORDER_RADIUS_OVAL_M, &mut log),
             "同序应放行"
+        );
+    }
+
+    /// 两个点位落在**同一个采样点**上 ⇒ 服务端给它们算出同一个「经过位置」
+    /// ⇒ 经过位置序列不严格递增 ⇒ type=9 会挂；而顺序检查看不见这种形态
+    /// （相同下标按数组序稳定排列 ⇒ 不算逆序）⇒ 必须单报一条。
+    ///
+    /// 实测踩过：起步里程压缩把窗口内几个打卡点一起压扁，相邻两个只剩
+    /// 5.5m < 命中半径 ⇒ 两次「首次经过」撞成同一下标 ⇒ 真机提交被判失败，
+    /// 而日志里点位残距全是 0.1m、看着毫无问题。
+    #[test]
+    fn point_order_flags_points_sharing_one_sample() {
+        // #0 与 #1 都在下标 12 被命中（挨太近），#2/#3 在 20/30。
+        let seen = vec![
+            (0usize, 12i64, "A".to_string()),
+            (1usize, 12i64, "B".to_string()),
+            (2usize, 20i64, "C".to_string()),
+            (3usize, 30i64, "D".to_string()),
+        ];
+        let logs: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
+        let l2 = std::rc::Rc::clone(&logs);
+        let mut log = move |s: &str| l2.borrow_mut().push(s.to_string());
+        warn_point_order(&seen, &mut log);
+        drop(log);
+        let got = logs.borrow();
+        assert!(
+            got.iter().any(|l| l.contains("落在同一个采样点上")),
+            "同一下标必须单独报出来：{got:?}"
+        );
+    }
+
+    /// 各点位下标互不相同 ⇒ 不报同一下标（别制造噪声）。
+    #[test]
+    fn point_order_clean_track_reports_no_collision() {
+        let seen = vec![
+            (0usize, 12i64, "A".to_string()),
+            (1usize, 22i64, "B".to_string()),
+            (2usize, 30i64, "C".to_string()),
+        ];
+        let logs: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
+        let l2 = std::rc::Rc::clone(&logs);
+        let mut log = move |s: &str| l2.borrow_mut().push(s.to_string());
+        warn_point_order(&seen, &mut log);
+        drop(log);
+        let got = logs.borrow();
+        assert!(
+            !got.iter().any(|l| l.contains("落在同一个采样点上")),
+            "下标互不相同，不该报同一下标：{got:?}"
+        );
+        assert!(
+            got.iter().any(|l| l.contains("顺序正确")),
+            "同序应报顺序正确：{got:?}"
+        );
+    }
+
+    /// 逆序提示必须带**证据等级**：上游 issue #37 的意见——别用断言语气写
+    /// 推断（自检全绿 ≠ 服务端会判过；没配这条规则的学校也不适用）。
+    #[test]
+    fn point_order_error_message_marks_evidence_level() {
+        let seen = vec![
+            (0usize, 30i64, "A".to_string()),
+            (1usize, 12i64, "B".to_string()),
+        ];
+        let logs: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
+        let l2 = std::rc::Rc::clone(&logs);
+        let mut log = move |s: &str| l2.borrow_mut().push(s.to_string());
+        warn_point_order(&seen, &mut log);
+        drop(log);
+        let got = logs.borrow();
+        assert!(
+            got.iter()
+                .any(|l| l.contains("顺序") && l.contains("本地推断")),
+            "逆序提示必须标出证据等级：{got:?}"
         );
     }
 }
