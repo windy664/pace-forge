@@ -9,3 +9,6 @@ accounts.json
 *.session
 pace-forge-device-id*
 *.tmp
+
+# 构建产物（musl 静态二进制）
+/pace-forge-musl

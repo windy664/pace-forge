@@ -67,11 +67,17 @@ pub fn startup_sec(total_sec: i64) -> i64 {
 /// 首段 `distance` 与真机差一个数量级，而且整条轨迹在起步期就把 15% 的里程
 /// 用掉了。这个常量配上 [`compress_startup`] 把时间窗口和里程窗口拆开。
 ///
-/// ⚠️ **这是真机基准，不是运行值**。运行值取自配置
-/// [`crate::config::Run::startup_dist_ratio`]（默认 **3%**）：1.1% 会让起步
-/// 段的点挤成一坨（18 分钟 / 3 公里：起步 167 秒里的 34 个点全落在 34 米内，
-/// 每点 1.0 米，正常段 15.7 米），3% 把每点提到约 2.6 米。字段清零口径
-/// （时间窗口 15.5%）**不变**，所以服务端能看到的「起步期速度为 0」结构照旧。
+/// ⚠️ **这是真机基准，也是默认运行值**（配置
+/// [`crate::config::Run::startup_dist_ratio`] 的缺省值 = 1.1%）。
+///
+/// 早先运行值取 3%，理由是「1.1% 会让起步段的点挤成一坨」—— 但那正是
+/// **真机形态**（真机 18 点挤在 13.6 m，密度比 18.4×）。真正需要修的不是
+/// 「挤」，而是「压缩把窗口里的**打卡点**一起压扁」；修法见
+/// [`apply_startup_budget`]（把里程预算挪到采样阶段的弧长分配里），
+/// 修完之后 1.1% 下首过序在 5 个距离 × 24 seed 上全对。
+///
+/// 字段清零口径（时间窗口 15.5%）**不变**，所以服务端能看到的「起步期速度
+/// 为 0」结构照旧。
 pub const REAL_DEVICE_STARTUP_DIST_RATIO: f64 = 0.011;
 
 /// 起步窗口覆盖多少个采样点。
@@ -165,14 +171,18 @@ pub fn cap_advances(adv: &mut [f64], caps: &[f64], total: f64) {
 /// 原地压缩起步窗口：把窗口内采样点的里程压到全程的起步里程预算，
 /// 后面的点顺延补上，末点仍钉在总长。
 ///
-/// `checkpoints` 是这次跑必须经过的点位（BD-09）。压缩会**重铺**采样网格，
-/// 而重铺会把网格沿路径整体平移（实测某校 3km/18min 平移最多 167m）——
-/// 打卡点的命中点因此被甩到别的圈上去，「首次经过」落到后面几圈，
-/// 服务端判「按顺序通过所有点位」直接失败。所以重铺完要把每个打卡点
-/// **钉**回网格（见 [`anchor_checkpoints`]）。
+/// ⚠️ **正常情况下这里是恒等操作**：里程预算已经在**采样阶段**分配好了
+/// （[`sample_by_time`] → [`apply_startup_budget`]），窗口弧长已经落在预算
+/// 里 ⇒ 本函数只做「打卡点锚定」，不再重铺。
 ///
-/// 起步里程预算取自配置 [`crate::config::Run::startup_dist_ratio`]（默认 3%，
-/// 真机是 1.1%）—— 两者差的是「起步段的点挤不挤」，见该字段的注释。
+/// 保留重铺分支是为了兜住那些**不经过 `sample_by_time`** 的调用路径（离线
+/// 预览、单元测试夹具）。但重铺有代价：它会把网格沿路径整体平移（实测某校
+/// 3km/18min 平移最多 167m）⇒ 打卡点的命中点被甩到别的圈 ⇒ 「首次经过」
+/// 落到后面几圈 ⇒ 服务端判「按顺序通过所有点位」失败。所以重铺完要把每个
+/// 打卡点**钉**回网格（见 [`anchor_checkpoints`]）。
+///
+/// 起步里程预算取自配置 [`crate::config::Run::startup_dist_ratio`]（默认
+/// 1.1%，= 真机同款），见该字段的注释。
 pub fn compress_startup(
     pts: &mut [TrackPoint],
     start_ms: i64,
@@ -215,6 +225,25 @@ pub fn compress_startup_with_ratio(
     }
     let total_len = acc;
     if total_len <= 0.0 {
+        return;
+    }
+    // 采样阶段（[`sample_by_time`] → [`apply_startup_budget`]）已经按里程预算
+    // 分配过弧长了 ⇒ 窗口弧长已经落在预算里 ⇒ 这里**不再重铺**。
+    //
+    // 重铺会把窗口**再压一次**（cluster = 目标 − 一个采样步长）⇒ 窗口外的点
+    // 被仿射平移 + 拉伸 ⇒ 打卡点的命中点被甩到别的圈：实测 3.0km 与 3.2km
+    // 各有 seed 出现「某个打卡点的首次经过落到下一圈」。
+    //
+    // 这条路径只保留「打卡点锚定」：把采样网格钉到打卡点的弧长上。
+    let target_first = total_len * startup_dist_ratio;
+    if arc[k - 1] <= target_first * 1.05 {
+        let mut want = arc.clone();
+        anchor_checkpoints(&mut want, &arc, pts, checkpoints);
+        let out = interp_on_polyline(pts, &arc, &want, total_len);
+        for (i, (la, lo)) in out.into_iter().enumerate() {
+            pts[i].lat = la;
+            pts[i].lon = lo;
+        }
         return;
     }
     // 压缩段的目标弧长：预算是全程的起步里程比，但要**预留一个采样间隔**。
@@ -855,6 +884,190 @@ fn chord_hits_blocker(a: (f64, f64), b: (f64, f64), blockers: &[Vec<(f64, f64)>]
     false
 }
 
+/// 起步窗口的弧长按**里程预算**重新分配。
+///
+/// 真机形态：起步 15.5% 的时间里只走完全程 1.1% 的里程（114 点样本里
+/// 前 18 点走 13.6 m，0.76 m/点），之后一路加速到主体配速。
+///
+/// ⚠️ 原来这一步是 [`compress_startup`] 在**采样之后**做的「弧长重铺」。
+/// 那时起步窗口里已经坐满了采样点（实测某校 5 个打卡点有 4 个落在窗口内），
+/// 重铺把整个窗口压到预算里 ⇒ **连打卡点一起压扁**：实测压缩后相邻打卡点
+/// 只剩 5.5 m，而服务端按 10 m 半径判「首次经过」⇒ 两次经过撞成同一下标 ⇒
+/// 「按顺序通过所有点位」失败。
+///
+/// 改在**采样之前**做：弧长分配阶段就把窗口压进预算，采样点自然落在压扁后
+/// 的窗口上。窗口内没有打卡点被撑开的位置 ⇒ 打卡点留在窗口外 ⇒ 首过序不再
+/// 被压缩破坏。窗口外的点按比例铺到剩余弧长（总里程不变，主体段因此略快
+/// ——「前慢后快」正是真机的形态）。
+fn apply_startup_budget(s: &mut [f64], k: usize, target_window: f64, total_len: f64) {
+    let n = s.len();
+    if k < 2 || k > n || target_window <= 0.0 || target_window >= total_len {
+        return;
+    }
+    let anchor = s[k - 1];
+    let span = total_len - anchor;
+    if span <= 1e-9 {
+        return;
+    }
+    let old: Vec<f64> = s.to_vec();
+    for (i, v) in s.iter_mut().enumerate().take(k) {
+        *v = target_window * (i as f64) / ((k - 1) as f64);
+    }
+    let rest = total_len - target_window;
+    for i in k..n {
+        let f = ((old[i] - anchor) / span).clamp(0.0, 1.0);
+        s[i] = target_window + rest * f;
+    }
+}
+
+/// GPS 掉点比例：真机 113 段里有 12 段位移恰好 0。
+///
+/// 真机（rrid 1328288734，114 点 / 113 段）的 `ΔtotalDis` 分布：
+/// 均值 14.90、sd 9.40、最大 31.07、`>20m` 36 段、`<5m` 28 段、**`==0` 12 段**。
+/// 那 12 段是「GPS 没动」——位移计数器冻结在原地，下一段再把里程补回来
+/// （所以真机的 `ΔtotalDis` 最大能到 31.07m）。
+pub const GPS_DROPOUT_RATIO: f64 = 12.0 / 113.0;
+
+/// 掉点落点与打卡点的净空（米）。
+///
+/// 打卡点的「命中点」是**欧氏最近**的那个采样点（`snap_checkpoints` 的手法）。
+/// 掉点会把一个采样点**往回拉**（`s[i+1] = s[i]`）⇒ 如果它恰好是某个打卡点
+/// 的最近点，那个打卡点的命中点就换成了后面一个 ⇒ 「首次经过」次序乱
+/// （实测 dist 2900 / seed 12：cp#3 的命中点从 60 跳到 100）。
+///
+/// ⇒ 掉点落点离任何打卡点不足这个距离的候选，一律放弃。
+pub const GPS_DROPOUT_CLEAR_M: f64 = 30.0;
+
+/// 让少数采样点的位移**恰好为 0**（真机的「GPS 冻结」形态）。
+///
+/// ## 为什么需要
+///
+/// 真机的 `ΔtotalDis` 分布里有 12 个**真正的 0**；我们此前一个都没有
+/// —— `MIN_SAMPLE_GAP_M = 0.5` 把相邻采样点钉开，于是我们的分布变成
+/// 「更散但没有零点」（`>20m` 47 / `<5m` 44 / `==0` 0），
+/// 真机是「多数落在中段 + 少数几乎不动」。这个差别逐点可见。
+///
+/// ## 怎么做（**在弧长上做 ⇒ 总里程天然守恒**）
+///
+/// ```text
+/// s[i+1] = s[i]     这一段位移 0（计数器冻结在原地）
+/// s[i+2] 不动       下一段把两步的里程一起走完（补回来）
+/// ```
+///
+/// 于是总里程一点不变，而 `ΔtotalDis` 的分布里多出真机那样的 0，
+/// 同时紧跟着的一段变长（≈2 倍）—— 真机的最大 `ΔtotalDis` 31.07m
+/// 就是这么来的。
+///
+/// ## 约束
+///
+/// - 不落在起步窗口里（窗口内的点本来就挤在一起，而且真机窗口内速度写 0）；
+/// - 离打卡点弧长 ≥ [`GPS_DROPOUT_CLEAR_M`]（钉在打卡点上的点不能动）；
+/// - 相邻两段不同时掉（否则会连着两段 0，真机没有这种形状）。
+///
+/// 返回掉了几段。
+#[expect(
+    clippy::too_many_arguments,
+    reason = "掉点要同时拿到弧长网格、几何、打卡点与三档阈值"
+)]
+pub fn apply_gps_dropouts(
+    s: &mut [f64],
+    path: &[(f64, f64)],
+    arc: &[f64],
+    blockers: &[Vec<(f64, f64)>],
+    seed: u64,
+    startup_k: usize,
+    protected: &[(f64, f64)],
+    max_catchup_m: f64,
+) -> usize {
+    let n = s.len();
+    if n < 6 {
+        return 0;
+    }
+    // 目标个数：真机比例（12/113）。
+    let target = (((n - 1) as f64) * GPS_DROPOUT_RATIO).round() as usize;
+    if target == 0 {
+        return 0;
+    }
+    // 候选：起步窗口之外、离打卡点足够远。
+    let mut cands: Vec<usize> = Vec::new();
+    for i in (startup_k + 1)..(n - 2) {
+        // ⚠️ 净空按**打卡点坐标**算，不按弧长。
+        //
+        // 打卡点的「命中点」是**欧氏最近**的那个采样点（`snap_checkpoints`
+        // 的手法）。掉点会把一个采样点往回拽 ⇒ 如果它恰好是某个打卡点的
+        // 最近点，那个打卡点的命中点就换成了后面一个 ⇒ 「首次经过」次序
+        // 乱（实测 dist 2900 / seed 12：cp#3 的命中点从 60 跳到 100 ⇒
+        // cp#4（71）反而先到 ⇒ 次序反了）。
+        //
+        // ⇒ 掉点落点离任何打卡点太近就放弃这一段。
+        let landed = point_at_arc(path, arc, s[i]);
+        if protected
+            .iter()
+            .any(|&cp| geo::distance(landed, cp) < GPS_DROPOUT_CLEAR_M)
+        {
+            continue;
+        }
+        // 补回来的那一段 = 掉点段 + 它后面那段。掉点把两段里程压进一段，
+        // 长度翻倍 ⇒ 真机 `ΔtotalDis` 的 p99 是 30.6m、硬上限 50m
+        //（「不像走出来的」）⇒ 候选必须满足补段不超长。
+        if s[i + 2] - s[i] > max_catchup_m {
+            continue;
+        }
+        // ⚠️ **补段那条弦不许触发拐角/穿墙补位**。
+        //
+        // 补位会把「下一个采样点」挪到折线顶点上 ⇒ 几何变了 ⇒ 打卡点的
+        // 命中点可能被挪走 ⇒ 「首次经过」次序乱（实测 5 距离 × 24 seed
+        // 里 2 个组合乱序：dist 2900/seed 20、dist 3500/seed 7）。
+        //
+        // 所以候选先自检：补段那条弦如果会压楼、或者切角切得比容差还狠，
+        // 这一段就不掉（宁可少掉几个，也不改几何）。
+        let pa = point_at_arc(path, arc, s[i]);
+        let pb = point_at_arc(path, arc, s[i + 2]);
+        if chord_hits_blocker(pa, pb, blockers) {
+            continue;
+        }
+        let cuts_corner = worst_corner(path, arc, s[i], s[i + 2], CORNER_MIN_TURN_DEG)
+            .is_some_and(|(_, dev)| dev > CORNER_CHORD_TOL_M);
+        if cuts_corner {
+            continue;
+        }
+        cands.push(i);
+    }
+    if cands.is_empty() {
+        return 0;
+    }
+    // 伪随机地挑（真机掉点的位置没有规律），同 seed 可复现。
+    // 用哈希排序而不是 RNG 状态机：挑完就结束，不需要顺序状态。
+    let mut ranked: Vec<(u64, usize)> = cands
+        .iter()
+        .map(|&i| {
+            let h = (i as u64)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(seed)
+                .wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            (h ^ (h >> 31), i)
+        })
+        .collect();
+    ranked.sort_unstable();
+    let mut picked: Vec<usize> = Vec::new();
+    for (_, i) in ranked {
+        // 相邻两段不同时掉。
+        if picked.iter().any(|&j| j.abs_diff(i) < 2) {
+            continue;
+        }
+        picked.push(i);
+        if picked.len() >= target {
+            break;
+        }
+    }
+    picked.sort_unstable();
+    // 落地：这一段位移 0，下一段把两步的里程一起走完（总里程守恒）。
+    for &i in &picked {
+        s[i + 1] = s[i];
+    }
+    picked.len()
+}
+
 /// 沿折线按**时间**取上报点（等时间采样）。
 ///
 /// 与 [`retime`] 的分工：`retime` 是「几何定了，反推时间」（等距离采样的
@@ -903,6 +1116,39 @@ pub fn sample_by_time(
     blockers: &[Vec<(f64, f64)>],
     checkpoints: &[(f64, f64)],
 ) -> Vec<TrackPoint> {
+    sample_by_time_with_ratio(
+        path,
+        times_ms,
+        seed,
+        kin,
+        v_floor,
+        v_ceil,
+        blockers,
+        checkpoints,
+        crate::config::global().run.startup_dist_ratio,
+    )
+}
+
+/// [`sample_by_time`] 的**起步里程预算**可调版本。
+///
+/// 预算必须**采样与压缩两边一致**（本项目踩过的又一次「量具口径不一致」）：
+/// 采样阶段按 1.1% 分配、压缩阶段按 3% 重铺 ⇒ 压缩把窗口外的点平移+拉伸
+/// ⇒ 打卡点的命中点被甩到下一圈 ⇒ 首过序乱。
+#[expect(
+    clippy::too_many_arguments,
+    reason = "参数扫描要同时驱动形状、采样与起步预算"
+)]
+pub fn sample_by_time_with_ratio(
+    path: &[(f64, f64)],
+    times_ms: &[i64],
+    seed: u64,
+    kin: &kinematics::KinParams,
+    v_floor: f64,
+    v_ceil: f64,
+    blockers: &[Vec<(f64, f64)>],
+    checkpoints: &[(f64, f64)],
+    startup_dist_ratio: f64,
+) -> Vec<TrackPoint> {
     let n = times_ms.len();
     if path.len() < 2 || n < 2 {
         return Vec::new();
@@ -944,6 +1190,11 @@ pub fn sample_by_time(
     let mut s: Vec<f64> = (0..n)
         .map(|i| total_len * i as f64 / (n - 1) as f64)
         .collect();
+    // 起步窗口（真机同款：15.5% 的时间）按**里程预算**分配弧长。
+    //
+    // 这一步必须在采样**之前**做（见 [`apply_startup_budget`] 的注释）：
+    // 采样之后再压，窗口里的打卡点会被一起压扁，首过序就乱了。
+    let startup_k = startup_point_count(times_ms, times_ms[0], total_sec as i64);
     for _ in 0..2 {
         let pts: Vec<(f64, f64)> = s.iter().map(|&x| point_at_arc(path, &arc, x)).collect();
         let speeds =
@@ -965,6 +1216,10 @@ pub fn sample_by_time(
             *last = total_len;
         }
         s = ns;
+        // 每一轮积分之后都把起步窗口按里程预算重新分配：归一化（`scale`）
+        // 是全局的，会把窗口里省下的里程按比例摊回窗口外 ⇒ 不重新分配的话，
+        // 窗口弧长会随迭代一路涨回全程比例。
+        apply_startup_budget(&mut s, startup_k, total_len * startup_dist_ratio, total_len);
     }
 
     // 单步位移封顶：收敛迭代按比例拉伸网格，顶在规则上限的那批点会被再
@@ -980,6 +1235,38 @@ pub fn sample_by_time(
         cap_advances(&mut s, &caps, total_len);
     }
 
+    // 打卡点在路径上的**首次**经过弧长：先算出来。
+    //
+    // 两处要用：① 钉扎（把最近的采样点拉到点位上）；② GPS 掉点的净空判断
+    // （钉在打卡点上的采样点不能被拉回，见 [`apply_gps_dropouts`]）。
+    let cp_targets: Vec<f64> = if checkpoints.is_empty() {
+        Vec::new()
+    } else {
+        checkpoints
+            .iter()
+            // **首次**经过的那一段，不是全局最近的那一段：多圈轨迹上同一个
+            // 打卡点每圈都经过，全局最近落在哪一圈由 GPS 噪声决定（详见
+            // `first_arc_on`）。对齐错了圈，服务端看到的首次经过次序就乱。
+            .filter_map(|&cp| first_arc_on(path, &arc, cp, CHECKPOINT_SNAP_MAX_M))
+            .map(|t| t.0)
+            .collect()
+    };
+    // GPS 掉点：让少数采样点的位移恰好为 0（真机 113 段里 12 段）。
+    //
+    // ⚠️ 必须在**钉扎之前**：钉扎把点拉到打卡点上，掉点把后一个点往回拉，
+    // 两者撞在一起就会把「首次经过」的命中点拽偏 ⇒ 首过序可能乱。
+    apply_gps_dropouts(
+        &mut s,
+        path,
+        &arc,
+        blockers,
+        seed,
+        startup_k,
+        checkpoints,
+        // 补段上限：真机 `ΔtotalDis` 的 p99 是 30.6m，体检按 p99 卡 ⇒ 取 30m。
+        30.0,
+    );
+
     // 把最近的采样弧长**对齐到打卡点**（在弧长空间做，不是事后挪点）。
     //
     // 5 秒网格在真机速度下相邻两点 5~31m，打卡点落在两点之间时最近采样点
@@ -988,15 +1275,8 @@ pub fn sample_by_time(
     // 对齐：采样点落在点位弧长上，两侧间距只被拉伸 ≤ 半个步长。
     // 被钉到打卡点上的采样下标：后面的拐角 override 不许再挪它们。
     let mut pinned: Vec<usize> = Vec::new();
-    if !checkpoints.is_empty() && n >= 3 {
-        for &cp in checkpoints {
-            // **首次**经过的那一段，不是全局最近的那一段：多圈轨迹上同一个
-            // 打卡点每圈都经过，全局最近落在哪一圈由 GPS 噪声决定（详见
-            // [`first_arc_on`]）。对齐错了圈，服务端看到的首次经过次序就乱。
-            let Some(target) = first_arc_on(path, &arc, cp, CHECKPOINT_SNAP_MAX_M) else {
-                // 轨迹压根没经过它：不动，让 preflight 如实报 CP_MISS
-                continue;
-            };
+    if !cp_targets.is_empty() && n >= 3 {
+        for target in cp_targets {
             // 按「离目标弧长多远」排候选，逐个试：最近的那个可能**挪不动**
             // （两侧邻居太近，`lo >= hi`），这时换下一个候选，而不是直接放弃
             // ——放弃就等于这个打卡点没被命中，服务端的「首次经过」会落到
@@ -1005,14 +1285,14 @@ pub fn sample_by_time(
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| *i > 0 && *i + 1 < n)
-                .map(|(i, x)| ((*x - target.0).abs(), i))
+                .map(|(i, x)| ((*x - target).abs(), i))
                 .collect();
             cands.sort_by(|a, b| a.0.total_cmp(&b.0));
             for (_, idx) in cands.iter().take(6) {
                 let lo = s[idx - 1] + MIN_SAMPLE_GAP_M;
                 let hi = s[idx + 1] - MIN_SAMPLE_GAP_M;
                 if lo < hi {
-                    s[*idx] = target.0.clamp(lo, hi);
+                    s[*idx] = target.clamp(lo, hi);
                     if !pinned.contains(idx) {
                         pinned.push(*idx);
                     }
@@ -1028,11 +1308,27 @@ pub fn sample_by_time(
     // `ΔtotalTime` 里根本没有 1 秒和 2 秒（`preflight` 的 `SAMPLE_RATE_SHORT`
     // 现在会直接拦）。挪点不改时间戳，节奏零代价，几何照样绕开拐角——
     // 和 `snap_checkpoints` 是同一个手法。
-    let mut override_pos: Option<(f64, f64)> = None;
+    // 补位结果 = (位置, 该位置的弧长)。
+    let mut override_pos: Option<((f64, f64), f64)> = None;
+    // 上一条**实际发出去**的弦的起点弧长。
+    //
+    // ⚠️ 拐角补位会把点**往回挪**（挪到弦区间里的折线顶点），所以下一条弦
+    // 必须从「实际发出去的那个位置」算，不能还用 `s[i]`。
+    //
+    // 实测（这条判据自己会错的又一次）：补位前检测的是 `s[i] → s[i+1]`，
+    // 补位后真正的弦变成了「顶点 → s[i+2]」，**更长**、起点更靠前 ⇒
+    // 可能压到楼，而检测器从没见过它 ⇒ 采样反而**新增**穿墙。
+    // 夹具（33m 楼 + `avoid_blockers` 绕行折线，15 点采样）实测：
+    // 补位把点 7 挪到弧长 102.1（原 114.4），于是真正的弦
+    // 「(-18.0, 0.0) → (-16.3, 18.6)」蹭进楼角 9cm，而检测器量的是
+    // 「弧长 114.4 → …」那段短的 ⇒ 判成「没穿墙」⇒ 漏放。
+    let mut cur_arc;
     for i in 0..n {
-        let q = override_pos
-            .take()
-            .unwrap_or_else(|| point_at_arc(path, &arc, s[i]));
+        let (q, q_arc) = match override_pos.take() {
+            Some((pos, a)) => (pos, a),
+            None => (point_at_arc(path, &arc, s[i]), s[i]),
+        };
+        cur_arc = q_arc;
         out.push(TrackPoint {
             lat: q.0,
             lon: q.1,
@@ -1046,12 +1342,13 @@ pub fn sample_by_time(
             continue;
         }
         let (pa, pb) = (
-            point_at_arc(path, &arc, s[i]),
+            point_at_arc(path, &arc, cur_arc),
             point_at_arc(path, &arc, s[i + 1]),
         );
         // ① 穿墙优先：弦压到楼上就一定要绕开
-        let picked = if chord_hits_blocker(pa, pb, blockers) {
-            let hit = worst_corner(path, &arc, s[i], s[i + 1], 0.0);
+        let is_wall = chord_hits_blocker(pa, pb, blockers);
+        let picked = if is_wall {
+            let hit = worst_corner(path, &arc, cur_arc, s[i + 1], 0.0);
             if hit.is_none() {
                 // 区间里没有可用的折线顶点：整条折线就是这条直线，
                 // 只能如实穿过去（与 `avoid_blockers` 的「避不开就保持原样」一致）
@@ -1059,7 +1356,7 @@ pub fn sample_by_time(
             hit
         } else {
             // ② 折返级急转 + 偏离超容差
-            worst_corner(path, &arc, s[i], s[i + 1], CORNER_MIN_TURN_DEG)
+            worst_corner(path, &arc, cur_arc, s[i + 1], CORNER_MIN_TURN_DEG)
                 .filter(|(_, dev)| *dev > CORNER_CHORD_TOL_M)
         };
         let Some((vc, _dev)) = picked else {
@@ -1083,7 +1380,7 @@ pub fn sample_by_time(
         {
             continue;
         }
-        override_pos = Some(vc_pt);
+        override_pos = Some((vc_pt, vc));
     }
     out
 }
@@ -1513,6 +1810,12 @@ pub fn nudge_to_corners(
     let mut moved = 0usize;
     for i in 0..pts.len() - 1 {
         let (a, b) = ((pts[i].lat, pts[i].lon), (pts[i + 1].lat, pts[i + 1].lon));
+        // 位移恰好 0 的**掉点段**（GPS 冻结，见 [`apply_gps_dropouts`]）：
+        // 不能拿它去找拐角 —— 退化线段的「偏离」其实是到那一点的距离，
+        // 会把点拽到一个不相干的拐角上，掉点就没了。
+        if geo::distance(a, b) <= 1e-9 {
+            continue;
+        }
         let (lo, hi) = (idx[i], idx[i + 1]);
         if hi <= lo + 1 {
             continue;
@@ -2647,6 +2950,127 @@ mod tests {
         (track, st)
     }
 
+    /// **GPS 掉点**的总里程不变量。
+    ///
+    /// 掉点的做法是「这一段位移 0，里程在下一段补回来」⇒ **总弧长一点不变**。
+    /// 这条守的就是这个不变量：一旦改成别的补偿方式（比如把里程直接丢掉），
+    /// 总里程就会短一截 ⇒ 服务端判「距离不足」。
+    #[test]
+    fn gps_dropouts_preserve_total_arc_length() {
+        // 一条直线：弧长 = 距离。
+        let path: Vec<(f64, f64)> = (0..=600)
+            .map(|i| (47.0, 103.0 + i as f64 * 0.0001))
+            .collect();
+        let mut arc = Vec::with_capacity(path.len());
+        arc.push(0.0);
+        for w in path.windows(2) {
+            arc.push(arc[arc.len() - 1] + geo::distance(w[0], w[1]));
+        }
+        // 120 个采样点，每点约 13m（真机速度下 5 秒 ~14m）。
+        let mut s: Vec<f64> = (0..120).map(|i| i as f64 * 13.0).collect();
+        let before = *s.last().unwrap();
+        let dropped = apply_gps_dropouts(&mut s, &path, &arc, &[], 42, 20, &[], 30.0);
+        assert!(dropped > 0, "没有掉点");
+        assert!(
+            (s[s.len() - 1] - before).abs() < 1e-9,
+            "总弧长变了：{before} → {}",
+            s[s.len() - 1]
+        );
+        let zeros = s.windows(2).filter(|w| (w[1] - w[0]).abs() < 1e-9).count();
+        assert_eq!(zeros, dropped, "零位移段数与掉点数对不上");
+        // 补回来的那一段不许超长（真机 `ΔtotalDis` 的 p99 = 30.6m）。
+        assert!(
+            s.windows(2).all(|w| w[1] - w[0] <= 30.0 + 1e-9),
+            "有段超过补段上限 30m"
+        );
+    }
+
+    /// **GPS 掉点**的分布要像真机。
+    ///
+    /// 真机（rrid 1328288734，113 段）：`ΔtotalDis` 有 **12 段恰好 0**
+    /// —— GPS 没动，位移计数器冻结，下一段把里程补回来（所以真机最大
+    /// `ΔtotalDis` 能到 31.07m）。我们此前一个都没有 ⇒ 分布「更散但没有零点」。
+    ///
+    /// 这条守：
+    /// 1. 零位移段的比例接近真机（12/113 ≈ 10.6%）；
+    /// 2. 每一段都不超过真机 p99（30.6m）；
+    /// 3. 时间节奏一点不变（掉点只动位置，不动时间戳）。
+    #[test]
+    fn gps_dropouts_match_real_device_shape() {
+        let path = oval_1683();
+        let times = sample_times(555, START_MS_SAMPLE_RATE_TESTS, SAMPLE_INTERVAL_SEC);
+        let mut track = sample_by_time_with_ratio(
+            &path,
+            &times,
+            START_MS_SAMPLE_RATE_TESTS as u64,
+            &kinematics::KinParams::default(),
+            1.0,
+            8.0,
+            &[],
+            &[],
+            REAL_DEVICE_STARTUP_DIST_RATIO,
+        );
+        compress_startup_with_ratio(
+            &mut track,
+            START_MS_SAMPLE_RATE_TESTS,
+            555,
+            None,
+            &[],
+            REAL_DEVICE_STARTUP_DIST_RATIO,
+        );
+        let d: Vec<f64> = track
+            .windows(2)
+            .map(|w| geo::distance((w[0].lat, w[0].lon), (w[1].lat, w[1].lon)))
+            .collect();
+        let zeros = d.iter().filter(|x| **x <= 1e-9).count();
+        let ratio = zeros as f64 / d.len() as f64;
+        let mut catchups: Vec<f64> = Vec::new();
+        let mut others: Vec<f64> = Vec::new();
+        for i in 0..d.len() {
+            if d[i] <= 1e-9 {
+                continue;
+            }
+            if i > 0 && d[i - 1] <= 1e-9 {
+                catchups.push(d[i]);
+            } else {
+                others.push(d[i]);
+            }
+        }
+        println!(
+            "[掉点] {} 段里 {zeros} 段位移恰好 0（{:.1}%，真机 10.6%）；补段 {:?}；其余最大 {:.2}m",
+            d.len(),
+            ratio * 100.0,
+            catchups,
+            others.iter().cloned().fold(0.0f64, f64::max)
+        );
+        assert!(zeros >= 3, "没有掉点：{zeros}");
+        // 候选筛选（离打卡点太近、补段超长）会砍掉一些 ⇒ 按区间守。
+        assert!(
+            (0.05..=0.16).contains(&ratio),
+            "掉点比例 {ratio:.3} 偏离真机 0.106"
+        );
+        // 补回来的那一段 ≤ 30m（掉点自己定的上限，比真机 p99 30.6m 还严）。
+        assert!(
+            catchups.iter().all(|x| *x <= 30.0 + 1e-6),
+            "有补段超过 30m：{catchups:?}"
+        );
+        // 其余段不许比真机最大 `ΔtotalDis`（31.07m）还长。
+        let max_other = others.iter().cloned().fold(0.0f64, f64::max);
+        assert!(
+            max_other <= 31.07 * 1.05,
+            "有一段 {max_other:.2}m 超过真机最大 31.07m"
+        );
+        // 时间节奏不变：间隔仍落在真机 `ΔtotalTime` 的取值集合里
+        // （真机 113 个间隔：5 秒 × 109、4 秒 × 1、3 秒 × 2、0 秒 × 1）。
+        for w in track.windows(2) {
+            let dt = w[1].time_ms - w[0].time_ms;
+            assert!(
+                matches!(dt, 3_000 | 4_000 | 5_000),
+                "时间间隔 {dt}ms 不在真机取值集合里"
+            );
+        }
+    }
+
     /// 时间轴本身的形状（点数、间隔、起步额外点）。
     #[test]
     fn time_grid_matches_real_device_shape() {
@@ -2975,7 +3399,20 @@ mod tests {
         assert_eq!(k, 18, "真机起步窗口是 18 个点");
 
         let per_point = |ratio: f64| -> (f64, Vec<f64>) {
-            let mut after = raw.clone();
+            // 预算必须走**采样阶段**（[`sample_by_time_with_ratio`]）——
+            // 压缩阶段现在只是「恒等 + 锚定」，单独驱动压缩量不到预算
+            // （压缩的幂等守卫：窗口弧长已经在预算里 ⇒ 不再重铺）。
+            let mut after = sample_by_time_with_ratio(
+                &path,
+                &times,
+                START_MS_SAMPLE_RATE_TESTS as u64,
+                &kinematics::KinParams::default(),
+                1.0,
+                8.0,
+                &[],
+                &[],
+                ratio,
+            );
             compress_startup_with_ratio(
                 &mut after,
                 START_MS_SAMPLE_RATE_TESTS,
@@ -3324,8 +3761,17 @@ mod tests {
         ];
         let blockers = vec![building.clone()];
 
-        // 手工绕行：沿 y=0 走到楼前，从北侧 3m 外绕过，再回到 y=0（2m 步长）
-        let m = 3.0;
+        // 手工绕行：沿 y=0 走到楼前，从北侧绕过去，再回到 y=0（2m 步长）
+        //
+        // ⚠️ 绕行余量取 **0.5 m**（不是 3 m），这是**为了让夹具前提成立**：
+        // 这条门禁的前提是「naive 采样会切到楼角 ⇒ 穿楼」，而「切角是否穿楼」
+        // 取决于采样点落在哪儿。余量 3 m 时实测 5 档假设速度里有 2 档
+        // （20 点 / 16 点那两档）前提不成立 ⇒ 夹具**偶然失效**；
+        // 余量 0.5 m 时，任何跨过楼角的弦都必然蹭进楼里（楼角到绕行线
+        // 只有 0.5 m，弦只要往里偏一点就压楼）⇒ 5 档全部成立。
+        //
+        // ⇒ 教训：门禁的前提也得**构造性**成立，不能靠「碰巧」。
+        let m = 0.5;
         let mut path: Vec<(f64, f64)> = Vec::new();
         let mut x = 0.0;
         while x < bx0 - m {
@@ -3483,6 +3929,160 @@ mod tests {
             guarded_cross <= dense_cross,
             "采样新增了穿墙：密折线 {dense_cross} 段 → 采样后 {guarded_cross} 段"
         );
+    }
+
+    /// **诊断**：起步里程预算挪到采样阶段后，两条穿墙夹具的每一条弦到底
+    /// 怎么样（哪条穿楼、在不在起步窗口内、弦长多少）。
+    ///
+    /// 量具 = 与两条失败夹具**完全同构**的几何，只多打点。
+    #[test]
+    #[ignore = "诊断用的量具，不是门禁"]
+    fn diagnose_startup_budget_chord_crossings() {
+        let lat0 = 30.5;
+        let lng0 = 104.0;
+        let mlat = geo::M_PER_DEG_LAT;
+        let mlng = geo::m_per_deg_lng(lat0);
+        let to_deg = |x: f64, y: f64| (lat0 + y / mlat, lng0 + x / mlng);
+
+        // ── 夹具 A：手工 3m 绕行折线（33×33m 楼，中心 x=120）──────────
+        let (bx0, bx1) = (103.5, 136.5);
+        let (by0, by1) = (-16.5, 16.5);
+        let a_blockers = vec![vec![
+            to_deg(bx0, by0),
+            to_deg(bx0, by1),
+            to_deg(bx1, by1),
+            to_deg(bx1, by0),
+        ]];
+        let m = 0.5;
+        let mut path: Vec<(f64, f64)> = Vec::new();
+        let mut x = 0.0;
+        while x < bx0 - m {
+            path.push(to_deg(x, 0.0));
+            x += 2.0;
+        }
+        let mut y = 0.0;
+        while y < by1 + m {
+            path.push(to_deg(bx0 - m, y));
+            y += 2.0;
+        }
+        let mut px = bx0 - m;
+        while px < bx1 + m {
+            path.push(to_deg(px, by1 + m));
+            px += 2.0;
+        }
+        let mut y2 = by1 + m;
+        while y2 > 0.0 {
+            path.push(to_deg(bx1 + m, y2));
+            y2 -= 2.0;
+        }
+        let mut x2 = bx1 + m;
+        while x2 <= 240.0 {
+            path.push(to_deg(x2, 0.0));
+            x2 += 2.0;
+        }
+
+        // ── 夹具 B：直线穿楼 → avoid_blockers（楼在原点）──────────────
+        let b_blockers = vec![vec![
+            to_deg(-16.5, -16.5),
+            to_deg(-16.5, 16.5),
+            to_deg(16.5, 16.5),
+            to_deg(16.5, -16.5),
+        ]];
+        let raw_line: Vec<(f64, f64)> = (0..=100)
+            .map(|i| to_deg(-100.0 + i as f64 * 2.0, 0.0))
+            .collect();
+        let avoided = fence_route::avoid_blockers(&raw_line, &b_blockers, 3.0);
+
+        // (标签, 折线, 障碍, 假设用时秒数)
+        type Case<'a> = (
+            &'a str,
+            &'a Vec<(f64, f64)>,
+            &'a Vec<Vec<(f64, f64)>>,
+            Option<i64>,
+        );
+        let cases: Vec<Case> = vec![
+            ("A 手工绕行", &path, &a_blockers, None),
+            ("B avoid_blockers", &avoided, &b_blockers, Some(67)),
+        ];
+        for (tag, p, bl, sec_override) in cases {
+            let total = geo::path_length(p);
+            // 夹具 A：扫几个「假设速度」，看前提（naive 会切楼角）稳不稳。
+            let secs: Vec<i64> = match sec_override {
+                Some(v) => vec![v],
+                None => vec![
+                    (total / 2.5) as i64,
+                    (total / 3.0) as i64,
+                    (total / 3.5) as i64,
+                    (total / 4.0) as i64,
+                    (total / 5.0) as i64,
+                ],
+            };
+            for assumed_sec in secs {
+                let times =
+                    sample_times(assumed_sec, START_MS_SAMPLE_RATE_TESTS, SAMPLE_INTERVAL_SEC);
+                let span = (times[times.len() - 1] - times[0]) / 1000;
+                let k = startup_point_count(&times, START_MS_SAMPLE_RATE_TESTS, span);
+                let win_ms = startup_sec(span) * 1000;
+                let naive = sample_by_time_with_ratio(
+                    p,
+                    &times,
+                    START_MS_SAMPLE_RATE_TESTS as u64,
+                    &kinematics::KinParams::default(),
+                    0.5,
+                    10.0,
+                    &[],
+                    &[],
+                    REAL_DEVICE_STARTUP_DIST_RATIO,
+                );
+                let guarded = sample_by_time_with_ratio(
+                    p,
+                    &times,
+                    START_MS_SAMPLE_RATE_TESTS as u64,
+                    &kinematics::KinParams::default(),
+                    0.5,
+                    10.0,
+                    bl,
+                    &[],
+                    REAL_DEVICE_STARTUP_DIST_RATIO,
+                );
+                let xy = |t: &TrackPoint| ((t.lon - lng0) * mlng, (t.lat - lat0) * mlat);
+                let hits = |t: &[TrackPoint]| -> Vec<String> {
+                    let mut v = Vec::new();
+                    for i in 0..t.len().saturating_sub(1) {
+                        if chord_hits_blocker(
+                            (t[i].lat, t[i].lon),
+                            (t[i + 1].lat, t[i + 1].lon),
+                            bl,
+                        ) {
+                            let len =
+                                geo::distance((t[i].lat, t[i].lon), (t[i + 1].lat, t[i + 1].lon));
+                            let in_win = t[i].time_ms < t[0].time_ms + win_ms;
+                            let (ax, ay) = xy(&t[i]);
+                            let (bx, by) = xy(&t[i + 1]);
+                            v.push(format!(
+                                "弦{i}->{} len={len:.2}m 窗口内={in_win} A=({ax:.1},{ay:.1}) B=({bx:.1},{by:.1})",
+                                i + 1
+                            ));
+                        }
+                    }
+                    v
+                };
+                let nh = hits(&naive);
+                let gh = hits(&guarded);
+                println!(
+                    "=== {tag} 假设 {assumed_sec}s → 采样 {} 点（窗口 {k} 点）全长 {total:.1}m | naive 穿楼 {} | guarded 穿楼 {}",
+                    naive.len(),
+                    nh.len(),
+                    gh.len()
+                );
+                for h in nh.iter() {
+                    println!("    naive   {h}");
+                }
+                for h in gh.iter() {
+                    println!("    guarded {h}");
+                }
+            }
+        }
     }
 
     /// **折返**：入场尾巴接跑道那种 160° 急转，15 米弦会把「走进去」抹成直线。

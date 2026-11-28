@@ -212,6 +212,36 @@ pub struct SpeedFields {
     pub bd_s: MetersPerSec,
 }
 
+/// 上报速度的**下限**（m/s）：真机「几乎不动」时最慢能到多少。
+///
+/// 真机在「几乎静止」的采样点上，`speed` 也**不是 0**：
+/// - 逐点样本（rrid 1328288734）全表最慢 **260.42 min/km** ⇒ v = 0.064 m/s；
+/// - App 汇总页那条（19:20 / 6'08"）配速图最深处 **364'00"** ⇒ v = 0.046 m/s。
+///
+/// 我们此前把 v 直接 clamp 到 `[0, 6.3]` ⇒ 位移恰好 0 的「GPS 掉点」会算出
+/// `speed = 0` —— **真机从来没出现过的值**（真机的 0 只出现在起步灰段，
+/// 那是「还没进测速窗口」）。窗口外发 0 就是一条机器指纹。
+///
+/// ⇒ v 的下限取真机实测的最慢档：364 min/km ⇒ 0.0458 m/s。
+/// 对应的配速上限 364 min/km，真机也正好在这个量级。
+pub const MIN_REPORTED_SPEED_MPS: f64 = 1000.0 / (60.0 * 364.0);
+
+/// 「几乎不动」的掉点该发多少速度（m/s）。
+///
+/// 位移恰好 0 ⇒ v = 0 ⇒ 配速发 0（真机没有）。兜底不能是一个**常数**：
+/// 二十几个点全报同一个 364.00，本身又是一种指纹（真机那几个极值是
+/// 88.65 / 97.77 / 146.20 / 154.32 / 260.42，各不相同）。
+///
+/// ⇒ 在真机实测的「几乎静止」档（260.42~364 min/km）里按点序号散开。
+/// 只依赖下标、不依赖 seed：两处发射点（`point_json_full` /
+/// `smooth_point_speed`）必须算出同一个值，否则报文自相矛盾。
+fn almost_still_speed_mps(idx: usize) -> f64 {
+    let slow = 1000.0 / (60.0 * 260.42);
+    let h = (idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let u = ((h >> 33) as f64) / (1u64 << 31) as f64; // [0,1)
+    MIN_REPORTED_SPEED_MPS + (slow - MIN_REPORTED_SPEED_MPS) * u
+}
+
 impl SpeedFields {
     /// `prev_v` 是上一个采样点的点间速度（起步窗口里为 0）。
     pub fn from_mps(v: MetersPerSec, prev_v: MetersPerSec) -> Self {
@@ -883,6 +913,13 @@ pub fn point_json_full(
     // 纵轴拉到 156'~160'/km（#3/#4 截图实测），已回退。
     let v_mps = if idx == 0 || in_startup {
         0.0
+    } else if step_m <= 0.0 {
+        // **GPS 掉点**：位移恰好 0（真机 113 段里有 12 段这样）。
+        // 真机在这种点上 `speed` 也不是 0（最慢 260~364 min/km），
+        // 窗口外发 0 就是真机没有过的值 ⇒ 用真机实测的「几乎静止」档兜底，
+        // 按点序号散开（常数本身又是指纹）。见
+        // [`MIN_REPORTED_SPEED_MPS`]。
+        almost_still_speed_mps(idx)
     } else {
         // 上限 6.3 m/s 只兜 GPS 抖动（世界纪录配速的两倍还多）。**不设下限**：
         // 真机 v 实测低到 0.06 m/s（idx113 配速 260.42 min/km），早先那个
@@ -1427,10 +1464,14 @@ pub fn smooth_point_speed(items: &mut [Value]) {
             0.0
         } else {
             let dt = tim[i] - tim[i - 1];
-            if dt > 0.0 {
-                ((dis[i] - dis[i - 1]) / dt).clamp(0.0, MAX_POINT_SPEED_MPS)
-            } else {
+            if dt <= 0.0 {
                 0.0
+            } else if dis[i] - dis[i - 1] <= 0.0 {
+                // GPS 掉点（位移恰好 0）：配速不能发 0（真机没有这个值），
+                // 兜底档与 `point_json_full` 同一套、只依赖下标 ⇒ 两处一致。
+                almost_still_speed_mps(i)
+            } else {
+                ((dis[i] - dis[i - 1]) / dt).clamp(0.0, MAX_POINT_SPEED_MPS)
             }
         };
         // 与 `point_json_full` 共用 typed 的 `SpeedFields`，两处口径不会分叉（#38）。
@@ -5142,6 +5183,63 @@ mod tests {
     }
 
     // ---- merged from former `mod speed_units_tests` ----
+
+    /// **GPS 掉点**的 `speed` 不许是 0（窗口外）。
+    ///
+    /// 真机在「几乎不动」的采样点上 `speed` 也不是 0：逐点样本（rrid 1328288734）
+    /// 全表最慢 **260.42 min/km**，App 汇总页那条（19:20 / 6'08"）最慢
+    /// **364'00"**。我们此前把 v clamp 到 `[0, 6.3]` ⇒ 位移恰好 0 的掉点算出
+    /// `speed = 0` —— **真机从来没出现过的值**（真机的 0 只出现在起步灰段，
+    /// 那是「还没进测速窗口」）⇒ 窗口外发 0 就是一条机器指纹。
+    ///
+    /// 这条守：
+    /// 1. 掉点的 `speed` 不为 0，且落在真机实测的「几乎静止」档
+    ///    （260~364 min/km）；
+    /// 2. 起步窗口内仍然是硬 0（这条保护不许把窗口也带上去）。
+    #[test]
+    fn gps_dropout_speed_never_zero_outside_startup() {
+        // 40 个点、每点 14m；第 30 点与第 29 点同坐标（GPS 冻结 = 位移恰好 0）。
+        let n = 40;
+        let mut track: Vec<TrackPoint> = (0..n)
+            .map(|i| TrackPoint {
+                lat: 47.3794,
+                lon: 103.9502 + i as f64 * 14.0 / 111_320.0,
+                time_ms: 1_790_913_882_164 + i as i64 * 5_000,
+            })
+            .collect();
+        track[30].lon = track[29].lon;
+        let start_ms = track[0].time_ms;
+        let pts = build_points(&track, &[], start_ms, None).expect("建点");
+        // 起步窗口（15.5% × 195 秒 ≈ 30 秒 ⇒ 7 个点）内是硬 0。
+        let total_sec = (track[n - 1].time_ms - start_ms) / 1000;
+        let su = crate::track::startup_point_count(
+            &track.iter().map(|p| p.time_ms).collect::<Vec<_>>(),
+            start_ms,
+            total_sec,
+        );
+        for (i, q) in pts.iter().enumerate().take(su) {
+            assert_eq!(
+                q["speed"].as_f64().unwrap(),
+                0.0,
+                "第 {i} 点在起步窗口内，speed 应为 0"
+            );
+        }
+        // 掉点：speed 不为 0，且落在真机实测的「几乎静止」档里。
+        let sp = pts[30]["speed"].as_f64().unwrap();
+        let av = pts[30]["avgSpeed"].as_f64().unwrap();
+        assert!(sp > 0.0, "掉点的 speed 是 0（真机在窗口外从不为 0）");
+        assert!(
+            (260.0..=364.0).contains(&sp),
+            "掉点配速 {sp} 不在真机实测的 260~364 min/km 档"
+        );
+        assert!(av > 0.0, "掉点的 avgSpeed 是 0");
+        // 真机的不变量：speed ≈ 1000/(60·avgSpeed)。
+        let want = 1_000.0 / (60.0 * av);
+        assert!(
+            (sp - want).abs() <= want * 0.01 + 0.01,
+            "掉点 speed={sp} 与配速 {want:.4} 不符"
+        );
+    }
 
     /// #38：配速与 m/s 互为反算，v=0 时两边都是 0（真机口径，不是 ∞）。
     #[test]

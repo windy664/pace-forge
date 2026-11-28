@@ -470,6 +470,7 @@ mod tests {
         hr: f64,
         dists: &[f64],
         seeds: u64,
+        startup_dist_ratio: f64,
     ) -> Vec<(f64, u64)> {
         let cps = scrambled();
         let total_sec = 1080i64;
@@ -478,7 +479,7 @@ mod tests {
         for &dist_m in dists {
             for k in 0..seeds {
                 let start_ms = 1_700_000_000_000i64 + (k as i64) * 997;
-                let pts = reported_points(
+                let pts = reported_points_with_ratio(
                     &cps,
                     dist_m,
                     start_ms as u64,
@@ -488,6 +489,7 @@ mod tests {
                     hs,
                     hr,
                     REVERSAL_EPS,
+                    startup_dist_ratio,
                 );
                 let fp = first_pass(&xy_of(&pts), &cps, radius);
                 if !fp.windows(2).all(|w| w[0] < w[1]) {
@@ -506,7 +508,7 @@ mod tests {
         let mut c60 = 0usize;
         for k in 0..12u64 {
             let start_ms = 1_700_000_000_000i64 + (k as i64) * 997;
-            let pts = reported_points(
+            let pts = reported_points_with_ratio(
                 &cps,
                 3000.0,
                 start_ms as u64,
@@ -516,6 +518,7 @@ mod tests {
                 hs,
                 hr,
                 REVERSAL_EPS,
+                super::super::REAL_DEVICE_STARTUP_DIST_RATIO,
             );
             for x in reported_turns(&pts) {
                 if x > mx {
@@ -549,15 +552,33 @@ mod tests {
         out
     }
 
-    /// 把一条几何轨迹走完整条**上报链**，返回上报点。
+    /// 生产**默认值**必须等于真机同款预算。
     ///
-    /// 顺序与生产一致（见 `flow::sample_stage`）：采样 → 起步压缩 →
-    /// 打卡点对齐 → 吸附 → 限距 → 拐角补位 → 再限距。
+    /// 门禁里一律**显式**传 [`super::super::REAL_DEVICE_STARTUP_DIST_RATIO`]，
+    /// 不读全局配置 —— 否则改一下配置默认值就能让门禁静默失效（判据自己
+    /// 变松）。这条把两者钉在一起：谁改了默认值，这条当场失败，提醒他
+    /// 同步改门禁口径，或者改回来。
+    #[test]
+    fn production_default_budget_matches_real_device() {
+        let dflt = crate::config::Run::default().startup_dist_ratio;
+        assert_eq!(
+            dflt,
+            super::super::REAL_DEVICE_STARTUP_DIST_RATIO,
+            "生产默认起步预算 {dflt} 与真机同款预算 {} 不一致：门禁口径和生产口径会分叉",
+            super::super::REAL_DEVICE_STARTUP_DIST_RATIO
+        );
+    }
+
+    /// [`reported_points_with_ratio`] 的起步预算可调版本。
+    ///
+    /// 起步预算（`run.startup_dist_ratio`）会改变「起步窗口覆盖路径的哪一段
+    /// 弧长」⇒ 打卡点落不落在窗口里跟着变 ⇒ 上报层的首次经过序随预算变。
+    /// 扫描别的预算时必须走这个版本，否则量具和生产不是一个口径。
     #[expect(
         clippy::too_many_arguments,
-        reason = "上报链要同时拿到形状参数与判据阈值"
+        reason = "上报链要同时拿到形状参数、判据阈值与起步预算"
     )]
-    fn reported_points(
+    fn reported_points_with_ratio(
         cps: &[(f64, f64)],
         dist_m: f64,
         seed: u64,
@@ -567,10 +588,11 @@ mod tests {
         hs: f64,
         hr: f64,
         rev: f64,
+        startup_dist_ratio: f64,
     ) -> Vec<super::super::TrackPoint> {
         let geom = lap_track_through_with(cps, dist_m, 5.0, seed, alpha, hs, hr, rev);
         let times = super::super::sample_times(total_sec, start_ms, 5.0);
-        let mut pts = super::super::sample_by_time(
+        let mut pts = super::super::sample_by_time_with_ratio(
             &geom,
             &times,
             seed,
@@ -579,8 +601,16 @@ mod tests {
             7.68,
             &[],
             cps,
+            startup_dist_ratio,
         );
-        super::super::compress_startup(&mut pts, start_ms, total_sec, Some(7.68), cps);
+        super::super::compress_startup_with_ratio(
+            &mut pts,
+            start_ms,
+            total_sec,
+            Some(7.68),
+            cps,
+            startup_dist_ratio,
+        );
         super::super::align_samples_to_checkpoints(&mut pts, cps);
         let snap = super::super::snap_checkpoints(&mut pts, cps);
         let pinned: Vec<usize> = snap
@@ -652,7 +682,7 @@ mod tests {
 
             let geom = lap_track_through(&cps, 3000.0, 5.0, seed);
             let times = super::super::sample_times(total_sec, start_ms, 5.0);
-            let mut pts = super::super::sample_by_time(
+            let mut pts = super::super::sample_by_time_with_ratio(
                 &geom,
                 &times,
                 seed,
@@ -661,6 +691,7 @@ mod tests {
                 7.68,
                 &[],
                 &cps,
+                0.011,
             );
             let su = super::super::startup_point_count(
                 &pts.iter().map(|p| p.time_ms).collect::<Vec<_>>(),
@@ -779,7 +810,14 @@ mod tests {
                         println!("{alpha:>6.0} {hr:>6.1} {hs:>6.1} | 接缝 {jmax:.1}° —— 淘汰");
                         continue;
                     }
-                    let broken = reported_first_pass_broken(alpha, hs, hr, &dists, 24);
+                    let broken = reported_first_pass_broken(
+                        alpha,
+                        hs,
+                        hr,
+                        &dists,
+                        24,
+                        super::super::REAL_DEVICE_STARTUP_DIST_RATIO,
+                    );
                     if !broken.is_empty() {
                         println!(
                             "{alpha:>6.0} {hr:>6.1} {hs:>6.1} | 上报首过序 {} 处乱序 —— 淘汰",
@@ -926,34 +964,39 @@ mod tests {
     /// 单个 seed 通过等于没测（这是本项目踩过多次的「判据自己会错」）。
     #[test]
     fn reported_first_pass_order_follows_array_order() {
-        let broken =
-            reported_first_pass_broken(LOOP_ALPHA_DEG, LOOP_H_SCALE, LOOP_H_REV, &[3000.0], 24);
+        let broken = reported_first_pass_broken(
+            LOOP_ALPHA_DEG,
+            LOOP_H_SCALE,
+            LOOP_H_REV,
+            &[3000.0],
+            24,
+            super::super::REAL_DEVICE_STARTUP_DIST_RATIO,
+        );
         assert!(
             broken.is_empty(),
             "上报层首过序在部分 seed 上乱序：{broken:?}"
         );
     }
 
-    /// **已知问题（未修）**：上报层的首过序只在 3.0km 上稳。
+    /// 上报层的首过序必须在**每个距离**上都等于点位数组序。
     ///
-    /// 扫 5 个距离 × 24 个种子：3.0km 全过；2.5/2.9/3.2/3.5km 会出乱序
-    /// （圈数变了 ⇒ 起步窗口在路径上覆盖的弧长比例变了 ⇒ 打卡点落不落在
-    /// 窗口里跟着变）。实测 2.9km/seed 2：几何层首过序 [9,44,63,85,104] ✓，
-    /// 采样层却变成 [4,11,63,70,27] —— #4 被**提前**经过。
+    /// 扫 5 个距离 × 24 个种子，**起步里程预算用真机同款的 1.1%**
+    /// （显式传 [`REAL_DEVICE_STARTUP_DIST_RATIO`，不靠全局配置 ——
+    /// 靠全局配置的话，改默认值就能让这条门禁静默失效）。
     ///
-    /// 机制（已定位到一半）：路径在发夹处**自折**（两支挨得近），采样点/
-    /// 拐角补位一旦落进某个打卡点的 10m 邻域，就等于替它「提前经过」，
-    /// 服务端按 10m 半径判首次经过时次序就反了。真正的修法在几何层：
-    /// 把发夹撑开，让两支在空间上分开 >20m（路径不相邻 ⇒ 不会有提前经过）。
+    /// 这条曾经长期过不去，根因查了两轮：
     ///
-    /// ⚠️ 这条**依赖起步里程预算 ≥ 3%**（配置 `run.startup_dist_ratio`）。
+    /// 1. **第一轮猜错了**：以为是「路径在发夹处自折、两支挨得近，采样点
+    ///    提前落进打卡点的 10m 邻域」。实测**否掉了**：多圈轨迹上每个打卡点
+    ///    本来就有 4~5 支（每圈一支），跟自折无关。
+    /// 2. **真因是起步压缩把窗口里的打卡点压扁了**：某校 5 个打卡点有 4 个
+    ///    落在起步窗口内，压缩把整个窗口压到预算里 ⇒ 相邻打卡点只剩 5.5m
+    ///    < 服务端 10m 半径 ⇒ 两次「首次经过」撞成同一下标 ⇒ 次序乱。
     ///
-    /// 起步预算从真机的 1.1% 放到 3% 之后，起点那一段的几何变长，
-    /// 第一个打卡点的弧长位置随之���移 ⇒ 发夹自折处两支的分离度被拉开
-    /// ⇒ 10m 半径下不再提前经过。原先在这里乱序的 5 个组合全部消失。
-    ///
-    /// ⇒ 所以这条现在是**门禁**：谁把起步预算调回 1.1%（或者再往下），
-    /// 它就会当场失败并指出乱序组合。
+    /// 修法在几何层：把里程预算挪到**采样阶段**的弧长分配里
+    /// （`track::apply_startup_budget`）—— 压缩之前窗口就已经是预算内，
+    /// 窗口里没有打卡点被撑开的位置 ⇒ 压缩退化成恒等 + 锚定。
+    /// 于是 1.1%（真机同款）下 5 个距离 × 24 seed 全过。
     #[test]
     fn reported_first_pass_order_holds_at_other_distances() {
         let broken = reported_first_pass_broken(
@@ -962,6 +1005,7 @@ mod tests {
             LOOP_H_REV,
             &[2500.0, 2900.0, 3000.0, 3200.0, 3500.0],
             24,
+            super::super::REAL_DEVICE_STARTUP_DIST_RATIO,
         );
         assert!(
             broken.is_empty(),
@@ -984,6 +1028,315 @@ mod tests {
     /// 上报点 → 坐标对。
     fn xy_of(pts: &[super::super::TrackPoint]) -> Vec<(f64, f64)> {
         pts.iter().map(|p| (p.lat, p.lon)).collect()
+    }
+
+    /// **诊断**：上报层首次经过序乱序时，是**哪个打卡点**、被**哪一支**提前经过。
+    ///
+    /// 量具 = 真实上报链（[`reported_points_with_ratio`]）+ 生产判据（10 m 半径、
+    /// 按数组序取首次经过）。起步预算取**真机同款的 1.1%** —— 这是本轮要回
+    /// 到的目标值。
+    ///
+    /// 「支路」= 几何环上距该打卡点 < 10 m 的**连续下标簇**；一簇 = 一支。
+    /// 簇多于一支 ⇒ 路径在该点附近自折 ⇒ 采样点可能从另一支提前触及它。
+    #[test]
+    #[ignore = "诊断用的量具，不是门禁"]
+    fn diagnose_first_pass_breakdown() {
+        let cps = scrambled();
+        let total_sec = 1080i64;
+        let ratio = 0.011f64;
+        for &dist_m in &[2500.0f64, 2900.0, 3000.0, 3200.0, 3500.0] {
+            let mut printed = 0usize;
+            for k in 0..24u64 {
+                let start_ms = 1_700_000_000_000i64 + (k as i64) * 997;
+                let pts = reported_points_with_ratio(
+                    &cps,
+                    dist_m,
+                    start_ms as u64,
+                    start_ms,
+                    total_sec,
+                    LOOP_ALPHA_DEG,
+                    LOOP_H_SCALE,
+                    LOOP_H_REV,
+                    REVERSAL_EPS,
+                    ratio,
+                );
+                let xy = xy_of(&pts);
+                let fp = first_pass(&xy, &cps, 10.0);
+                if fp.windows(2).all(|w| w[0] < w[1]) {
+                    continue;
+                }
+                println!("=== 乱序 dist={dist_m} seed={k} 上报层首次经过={fp:?}");
+                let geom = lap_track_through_with(
+                    &cps,
+                    dist_m,
+                    5.0,
+                    start_ms as u64,
+                    LOOP_ALPHA_DEG,
+                    LOOP_H_SCALE,
+                    LOOP_H_REV,
+                    REVERSAL_EPS,
+                );
+                for (ci, cp) in cps.iter().enumerate() {
+                    let near: Vec<usize> = (0..geom.len())
+                        .filter(|&i| distance(geom[i], *cp) < 10.0)
+                        .collect();
+                    let mut clusters: Vec<(usize, usize)> = Vec::new();
+                    for &i in &near {
+                        match clusters.last_mut() {
+                            Some(last) if last.1 + 1 == i => last.1 = i,
+                            _ => clusters.push((i, i)),
+                        }
+                    }
+                    let hits: Vec<usize> = (0..xy.len())
+                        .filter(|&i| distance(xy[i], *cp) < 10.0)
+                        .collect();
+                    println!("  cp#{ci} 上报首次={} 邻域内上报点={:?}", fp[ci], hits);
+                    println!("      几何簇(10m)={clusters:?} ⇒ {} 支", clusters.len());
+                }
+                printed += 1;
+                if printed >= 2 {
+                    break;
+                }
+            }
+            if printed == 0 {
+                println!("=== dist={dist_m} 在 1.1% 预算下 24 seed 全过");
+            }
+        }
+    }
+
+    /// **诊断**：上报链**每一步**之后，各打卡点的首次经过下标。
+    ///
+    /// 用 dist=2500 / seed=2 —— 那是 1.1% 起步预算下唯一乱序的组合
+    /// （上报层首次经过 = [78, 49, 58, 65, 73]，#0 掉到最后）。
+    #[test]
+    #[ignore = "诊断用的量具，不是门禁"]
+    fn diagnose_first_pass_step_by_step() {
+        let cps = scrambled();
+        let total_sec = 1080i64;
+        let dist_m: f64 = std::env::var("DIAG_DIST")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2500.0);
+        let k: u64 = std::env::var("DIAG_SEED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+        let start_ms = 1_700_000_000_000i64 + (k as i64) * 997;
+        let seed = start_ms as u64;
+
+        let show = |tag: &str, p: &[(f64, f64)]| {
+            let fp = first_pass(p, &cps, 10.0);
+            let ok = fp.windows(2).all(|w| w[0] < w[1]);
+            println!("  {tag:22} fp={fp:?} {}", if ok { "✓" } else { "✗乱序" });
+        };
+
+        let geom = lap_track_through_with(
+            &cps,
+            dist_m,
+            5.0,
+            seed,
+            LOOP_ALPHA_DEG,
+            LOOP_H_SCALE,
+            LOOP_H_REV,
+            REVERSAL_EPS,
+        );
+        println!("=== dist={dist_m} seed={k} 1.1% 预算");
+        show("几何环", &geom);
+        println!("  几何点数={} 环长≈{:.0}m", geom.len(), {
+            let mut s = 0.0;
+            for i in 1..geom.len() {
+                s += distance(geom[i - 1], geom[i]);
+            }
+            s
+        });
+        for (i, cp) in cps.iter().enumerate() {
+            let near: Vec<usize> = (0..geom.len())
+                .filter(|&j| distance(geom[j], *cp) < 10.0)
+                .collect();
+            let mut cl: Vec<(usize, usize)> = Vec::new();
+            for &j in &near {
+                match cl.last_mut() {
+                    Some(l) if l.1 + 1 == j => l.1 = j,
+                    _ => cl.push((j, j)),
+                }
+            }
+            println!("    cp#{i} 几何簇={cl:?}");
+        }
+
+        let times = super::super::sample_times(total_sec, start_ms, 5.0);
+        let mut pts = super::super::sample_by_time_with_ratio(
+            &geom,
+            &times,
+            seed,
+            &super::super::kinematics::KinParams::default(),
+            1.67,
+            7.68,
+            &[],
+            &cps,
+            0.011,
+        );
+        show("+sample_by_time", &xy_of(&pts));
+        println!("    采样点数={}", pts.len());
+
+        super::super::compress_startup_with_ratio(
+            &mut pts,
+            start_ms,
+            total_sec,
+            Some(7.68),
+            &cps,
+            0.011,
+        );
+        show("+compress_startup", &xy_of(&pts));
+
+        super::super::align_samples_to_checkpoints(&mut pts, &cps);
+        show("+align_cp", &xy_of(&pts));
+
+        let snap = super::super::snap_checkpoints(&mut pts, &cps);
+        show("+snap_cp", &xy_of(&pts));
+        let pinned: Vec<usize> = snap
+            .items
+            .iter()
+            .filter(|s| s.shifted)
+            .map(|s| s.index)
+            .collect();
+        println!("    snap 明细={:?}", snap.items.len());
+        println!("    pinned={pinned:?}");
+
+        let max_gap = crate::api::submit::MAX_POINT_SPEED_MPS * super::super::SAMPLE_INTERVAL_SEC;
+        super::super::clamp_sample_gaps(&mut pts, &pinned, max_gap);
+        show("+clamp_gaps", &xy_of(&pts));
+
+        super::super::nudge_to_corners(&mut pts, &geom, 12.0, &pinned);
+        show("+nudge_corners", &xy_of(&pts));
+
+        super::super::clamp_sample_gaps(&mut pts, &pinned, max_gap);
+        show("+clamp_gaps2", &xy_of(&pts));
+    }
+
+    /// **诊断**：`compress_startup` 把打卡点从「窗口内」挪进了「挤在一起」的簇。
+    ///
+    /// 打印压缩前后的弧长分布、各打卡点在折线上的首次弧长、以及窗口内点
+    /// 与打卡点的相对位置。
+    #[test]
+    #[ignore = "诊断用的量具，不是门禁"]
+    fn diagnose_compress_startup_arcs() {
+        let cps = scrambled();
+        let total_sec = 1080i64;
+        let dist_m: f64 = std::env::var("DIAG_DIST")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2500.0);
+        let k: u64 = std::env::var("DIAG_SEED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+        let start_ms = 1_700_000_000_000i64 + (k as i64) * 997;
+        let seed = start_ms as u64;
+
+        let geom = lap_track_through_with(
+            &cps,
+            dist_m,
+            5.0,
+            seed,
+            LOOP_ALPHA_DEG,
+            LOOP_H_SCALE,
+            LOOP_H_REV,
+            REVERSAL_EPS,
+        );
+        let times = super::super::sample_times(total_sec, start_ms, 5.0);
+        let mut pts = super::super::sample_by_time_with_ratio(
+            &geom,
+            &times,
+            seed,
+            &super::super::kinematics::KinParams::default(),
+            1.67,
+            7.68,
+            &[],
+            &cps,
+            0.011,
+        );
+
+        // 压缩前的累计弧长
+        let mut arc: Vec<f64> = vec![0.0];
+        for i in 1..pts.len() {
+            arc.push(
+                arc[i - 1]
+                    + super::super::geo::distance(
+                        (pts[i - 1].lat, pts[i - 1].lon),
+                        (pts[i].lat, pts[i].lon),
+                    ),
+            );
+        }
+        let total_len = *arc.last().unwrap();
+        let su = super::super::startup_point_count(
+            &pts.iter().map(|p| p.time_ms).collect::<Vec<_>>(),
+            start_ms,
+            total_sec,
+        );
+        println!("=== dist={dist_m} seed={k}");
+        println!(
+            "  总弧长={total_len:.1}m  采样点={}  起步窗口={su} 点",
+            pts.len()
+        );
+        println!(
+            "  压缩前窗口内弧长 arc[{}]={:.1}m（占 {:.2}%）",
+            su - 1,
+            arc[su - 1],
+            arc[su - 1] / total_len * 100.0
+        );
+        println!("  压缩前窗口内每点弧长前 12 个: {:?}", {
+            let v: Vec<f64> = (1..=12)
+                .map(|i| (arc[i] - arc[i - 1]) * 1000.0)
+                .map(|v| (v / 1000.0 * 1000.0).round() / 1000.0)
+                .collect();
+            v
+        });
+        // 压缩后窗口外每点弧长
+        println!("  压缩前窗口外每点弧长 (su..su+8): {:?}", {
+            let v: Vec<f64> = (su..(su + 8).min(pts.len() - 1))
+                .map(|i| ((arc[i + 1] - arc[i]) * 1000.0).round() / 1000.0)
+                .collect();
+            v
+        });
+
+        // 各打卡点在折线上的首次弧长与首次下标
+        let xy: Vec<(f64, f64)> = pts.iter().map(|p| (p.lat, p.lon)).collect();
+        for (i, cp) in cps.iter().enumerate() {
+            let (a, d) = super::super::first_arc_on(&xy, &arc, *cp, 10.0).unwrap_or((-1.0, -1.0));
+            let idx = xy.iter().position(|q| distance(*q, *cp) < 10.0);
+            println!("  cp#{i} 首次弧长={a:.1}m 下标={:?} 距折线={d:.2}m", idx);
+        }
+
+        // 压缩后的窗口内弧长
+        super::super::compress_startup_with_ratio(
+            &mut pts,
+            start_ms,
+            total_sec,
+            Some(7.68),
+            &cps,
+            0.011,
+        );
+        let mut arc2: Vec<f64> = vec![0.0];
+        for i in 1..pts.len() {
+            arc2.push(
+                arc2[i - 1]
+                    + super::super::geo::distance(
+                        (pts[i - 1].lat, pts[i - 1].lon),
+                        (pts[i].lat, pts[i].lon),
+                    ),
+            );
+        }
+        println!(
+            "  压缩后窗口内弧长 arc2[{}]={:.1}m（占 {:.2}%）",
+            su - 1,
+            arc2[su - 1],
+            arc2[su - 1] / total_len * 100.0
+        );
+        let xy2: Vec<(f64, f64)> = pts.iter().map(|p| (p.lat, p.lon)).collect();
+        for (i, cp) in cps.iter().enumerate() {
+            let idx = xy2.iter().position(|q| distance(*q, *cp) < 10.0);
+            println!("  压缩后 cp#{i} 首次下标={:?}", idx);
+        }
     }
 
     /// 退化输入不能 panic。
