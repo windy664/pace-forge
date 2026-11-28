@@ -56,7 +56,7 @@ pub fn startup_sec(total_sec: i64) -> i64 {
     ((total_sec as f64 * STARTUP_RATIO).round() as i64).clamp(5, total_sec / 2)
 }
 
-/// 起步窗口吃掉的里程占全程的比例。
+/// **真机**起步窗口吃掉的里程占全程的比例（1.1%）。
 ///
 /// 时间窗口占 15.5%，但里程窗口只有 1.1%——真机 rrid 1328288734（555 秒 /
 /// 1683.83m / 114 点）首段 86 秒只走了 18.4m，`18.4 / 1683.83 = 1.093%`，
@@ -66,7 +66,13 @@ pub fn startup_sec(total_sec: i64) -> i64 {
 /// 轨迹本身仍然是匀速生成的，于是「首段 86 秒里字段写着 0、几何却跑了 250m」：
 /// 首段 `distance` 与真机差一个数量级，而且整条轨迹在起步期就把 15% 的里程
 /// 用掉了。这个常量配上 [`compress_startup`] 把时间窗口和里程窗口拆开。
-pub const STARTUP_DIST_RATIO: f64 = 0.011;
+///
+/// ⚠️ **这是真机基准，不是运行值**。运行值取自配置
+/// [`crate::config::Run::startup_dist_ratio`]（默认 **3%**）：1.1% 会让起步
+/// 段的点挤成一坨（18 分钟 / 3 公里：起步 167 秒里的 34 个点全落在 34 米内，
+/// 每点 1.0 米，正常段 15.7 米），3% 把每点提到约 2.6 米。字段清零口径
+/// （时间窗口 15.5%）**不变**，所以服务端能看到的「起步期速度为 0」结构照旧。
+pub const REAL_DEVICE_STARTUP_DIST_RATIO: f64 = 0.011;
 
 /// 起步窗口覆盖多少个采样点。
 ///
@@ -94,7 +100,7 @@ pub fn startup_point_count(times_ms: &[i64], start_ms: i64, total_sec: i64) -> u
 ///
 /// 这是「真机起步期几乎原地」这件事的几何实现：时间轴不动（采样间隔还是
 /// [`sample_times`] 给的那套 5 秒网格），只把这些点沿路径重新定位，让它们
-/// 落在全程 [`STARTUP_DIST_RATIO`] 的弧长里；窗口外的点按原弧长**比例**
+/// 落在全程起步里程预算（配置 `run.startup_dist_ratio`）的弧长里；窗口外的点按原弧长**比例**
 /// 铺到剩下的弧长（不做等距重铺，那样会把「点距里的速度信息」抹平——等时间
 /// 采样下 `ΔtotalDis` 正是靠点距起伏表达的，见 [`sample_by_time`]）。
 ///
@@ -156,7 +162,7 @@ pub fn cap_advances(adv: &mut [f64], caps: &[f64], total: f64) {
     }
 }
 
-/// 原地压缩起步窗口：把窗口内采样点的里程压到全程的约 1.1%，
+/// 原地压缩起步窗口：把窗口内采样点的里程压到全程的起步里程预算，
 /// 后面的点顺延补上，末点仍钉在总长。
 ///
 /// `checkpoints` 是这次跑必须经过的点位（BD-09）。压缩会**重铺**采样网格，
@@ -164,12 +170,31 @@ pub fn cap_advances(adv: &mut [f64], caps: &[f64], total: f64) {
 /// 打卡点的命中点因此被甩到别的圈上去，「首次经过」落到后面几圈，
 /// 服务端判「按顺序通过所有点位」直接失败。所以重铺完要把每个打卡点
 /// **钉**回网格（见 [`anchor_checkpoints`]）。
+///
+/// 起步里程预算取自配置 [`crate::config::Run::startup_dist_ratio`]（默认 3%，
+/// 真机是 1.1%）—— 两者差的是「起步段的点挤不挤」，见该字段的注释。
 pub fn compress_startup(
     pts: &mut [TrackPoint],
     start_ms: i64,
     total_sec: i64,
     max_step_mps: Option<f64>,
     checkpoints: &[(f64, f64)],
+) {
+    let ratio = crate::config::global().run.startup_dist_ratio;
+    compress_startup_with_ratio(pts, start_ms, total_sec, max_step_mps, checkpoints, ratio);
+}
+
+/// [`compress_startup`] 的可测版本：起步里程预算由参数给。
+///
+/// 单独拆出来是为了让「预算取多少」这件事能被测试直接驱动 —— 全局配置在
+/// 测试里也能换（`config::runtime::Guard`），但把参数摊开更直接。
+pub fn compress_startup_with_ratio(
+    pts: &mut [TrackPoint],
+    start_ms: i64,
+    total_sec: i64,
+    max_step_mps: Option<f64>,
+    checkpoints: &[(f64, f64)],
+    startup_dist_ratio: f64,
 ) {
     let n = pts.len();
     if n < 4 {
@@ -192,30 +217,28 @@ pub fn compress_startup(
     if total_len <= 0.0 {
         return;
     }
-    // 压缩段的目标弧长：预算是全程的 1.1%，但要**预留一个采样间隔**。
+    // 压缩段的目标弧长：预算是全程的起步里程比，但要**预留一个采样间隔**。
     //
     // 窗口末尾那个点（索引 k）已经出了窗口、按正常间距铺开，所以
     // `segment_json` 首段的里程其实等于「压缩段预算 + 一个采样步长」。
-    // 不留这个余量的话（367 点 / 1842m 实测），首段会拿到 1.4% 而不是
-    // 真机的 1.1%。减掉一个平均步长之后，首段落回 18~20m 的量级。
+    // 不留这个余差的话（367 点 / 1842m 实测），首段会多出一个采样步长。
     let step_est = total_len / n as f64;
-    // 目标：`segment_json` 首段的里程 = 全程的 1.1%（真机 18.4/1683.83）。
+    // 目标：`segment_json` 首段的里程 = 全程的 `startup_dist_ratio`。
     //
     // 首段跨到「起步窗口结束后的第一个采样点」，所以它等于「压缩段预算 +
     // 边界上那半个到一整个步长」。这一项没法用公式估准（窗口边界落在两个
     // 采样点之间，落点由速度决定），所以先按老公式给初值，再**按实测首段
     // 里程迭代收敛**：3 轮就够，映射对 cluster 近似 1:1。
-    // 窗口内至少每点 0.9m。
+    // 窗口内至少每点 0.9m —— 这是**下限**不是目标：真机是 0.76m/点，
+    // 预算放大到 3% 之后每点本来就有 2.6m，下限根本不会触发。
     //
     // 真机起步窗口 18 点走 13.6m（0.76m/点），整数化后基本每点 +1——窗口内
-    // speed/avgSpeed/bdS 发的是硬 0，这个分布只影响 totalDis 的整数码，
-    // 和真机一样保持「+0/+1 地爬」。0.9 贴着真机的 0.76，比老公式
-    // 「全程 1.1% 均摊」（2km 路线只有 0.36m/点）近得多。
+    // speed/avgSpeed/bdS 发的是硬 0，这个分布只影响 totalDis 的整数码。
     let min_per_point = k as f64 * 0.9;
-    let mut cluster = (total_len * STARTUP_DIST_RATIO - step_est)
+    let mut cluster = (total_len * startup_dist_ratio - step_est)
         .max(total_len * 0.002)
         .max(min_per_point);
-    let target_first = total_len * STARTUP_DIST_RATIO;
+    let target_first = total_len * startup_dist_ratio;
     let bound_time = start_ms + startup_sec(total_sec) * 1000;
 
     // 目标弧长：窗口内缓入 [0, cluster]，窗口外按比例铺到 [cluster, total_len]。
@@ -254,21 +277,30 @@ pub fn compress_startup(
     // 3'30"~10'00" 的跑被仿射放大出 2'39" 的尖刺）。`max_step_mps` 给了
     // 就按采样时间轴重新封顶——削掉的量顺延，总长不变；`None`（测试夹具）
     // 完全跳过，行为与原来逐字节一致。
-    if let Some(vmax) = max_step_mps {
+    // 封顶的 caps 只跟**时间轴**有关（不跟 cluster 有关），所以先算一次，
+    // 初始铺完用一次、下面收敛迭代每轮再用一次。
+    //
+    // ⚠️ 迭代里**必须**再封一次顶：收敛会改 cluster，而窗口外的放大系数是
+    // (total-cluster)/(total-anchor) —— cluster 变小 ⇒ 放大更多 ⇒ 单步弧长
+    // 重新顶出规则带。之前只在初始值封过一次，迭代改完 cluster 就直接拿去
+    // 插值了，于是「起步预算调大」会把窗口外的步长顶破（窄规则带实测
+    // 34.6m > 27.4m 上限）。
+    let caps: Option<Vec<f64>> = max_step_mps.map(|vmax| {
         // 封顶必须按**报文口径**的时间差算：报文里 `totalTime` 是整秒累计
         // （真机同款），4.91 秒的采样网格落在相邻整秒上，会有一批点对点
         // 只隔 4 秒。同样的 26m 走 4 秒段就是 6.5 m/s（issue #6 的 2'39"
         // 尖刺正是这么顶到 clamp 的），按毫秒网格封顶根本拦不住它。
-        let caps: Vec<f64> = pts
-            .windows(2)
+        pts.windows(2)
             .map(|w| {
                 let dt = (((w[1].time_ms - start_ms) as f64 / 1000.0).floor()
                     - ((w[0].time_ms - start_ms) as f64 / 1000.0).floor())
                 .max(1.0);
                 vmax * dt * 1.15
             })
-            .collect();
-        cap_advances(&mut want, &caps, total_len);
+            .collect()
+    });
+    if let Some(caps) = &caps {
+        cap_advances(&mut want, caps, total_len);
     }
 
     // 打卡点钉在网格上（见 [`anchor_checkpoints`]）：重铺会把网格沿路径平移，
@@ -306,14 +338,19 @@ pub fn compress_startup(
         if err.abs() <= total_len * 0.0005 {
             break;
         }
-        // 下限用 min_per_point：收敛的目标是「首段里程 1.1%」，但它会把
+        // 下限用 min_per_point：收敛的目标是「首段里程 = 起步预算」，但它会把
         // cluster 一路压回 ~8m，窗口内每点又只剩 0.36m，配速图开头重新断线。
         // 两个目标冲突时，用户看得见的那条线优先——首段里程是内部指标。
         //
         // 上界必须取 max，不能直接用 total_len*0.05：短而密的轨迹（平均点距
         // <2.79m）会让 min_per_point 大于 0.05*total_len，而 f64::clamp 在
         // min > max 时是 panic 而不是饱和截断，整条链路直接崩。
-        let hi = (total_len * 0.05).max(min_per_point);
+        //
+        // 上界还要跟着**起步预算**走：预算调到 5% 以上时（0.155 = 完全不
+        // 压缩），写死的 5% 上界会把 cluster 卡住，旋钮拧到底也没反应。
+        let hi = (total_len * startup_dist_ratio.max(0.05))
+            .max(total_len * 0.05)
+            .max(min_per_point);
         let next = (cluster + err).clamp(min_per_point, hi);
         if (next - cluster).abs() < 1e-6 {
             break;
@@ -332,6 +369,11 @@ pub fn compress_startup(
                 1.0
             };
             want.push(cluster + (total_len - cluster) * f);
+        }
+        // 重新封一次顶：cluster 变了 ⇒ 窗口外的放大系数变了（见上面的 caps
+        // 注释）。不重封的话，窗口外的单步弧长会重新顶出规则带。
+        if let Some(caps) = &caps {
+            cap_advances(&mut want, caps, total_len);
         }
         // 重新钉一次：cluster 变了，窗口内的弧长也变了。
         anchor_checkpoints(&mut want, &arc, pts, checkpoints);
@@ -1503,7 +1545,21 @@ pub fn nudge_to_corners(
         // 没有这个上限时实测把 2km/12min 的平均速度从 2.69 m/s 顶到
         // 3.67 m/s（里程虚增 36%），还制造出 43.9 m/s 的相邻跳变——
         // 那是比「斜切过楼角」严重得多的问题。
-        let limit = 20.0;
+        //
+        // ⚠️ **上限必须跟局部点间距挂钩**，不能是写死的绝对值。
+        //
+        // 起步窗口里上报点被刻意压到 1~3 米一个（见 `compress_startup`），
+        // 而 `dense` 是 5 米一格的密折线 ⇒ 这一段的 a→b 弦只有 1.3 米，
+        // `dense` 里的中间点离这条 1.3 米的短线却有十几米 ⇒ 「偏离 >
+        // dev_m」必然成立 ⇒ 把点挪 5 米出去，而**相邻间距只有 1.3 米**
+        // ⇒ 方向突变 ⇒ 上报层出现 170° 的尖刺（实测：12 个 seed 里有 5 个
+        // 的 max 转角从 78° 跳到 170°，全部由这一步引入）。
+        //
+        // ⇒ 上限取「局部间距的 1.5 倍」与 20 米里的**小者**：
+        // 正常段（间距 15 米）上限仍是 20 米（行为不变），密集段（间距
+        // 1.3 米）上限只有 2 米 ⇒ 5 米的那种挪动直接被拒。
+        let gap = geo::distance(a, b);
+        let limit = (gap * 1.5).min(20.0);
         let shift = geo::distance((pts[i + 1].lat, pts[i + 1].lon), dense[worst.0]);
         if shift > limit || shift <= 1e-9 {
             continue;
@@ -1588,7 +1644,7 @@ mod tests {
             let w = startup_sec(total);
             let pts = (0..=total).step_by(5).filter(|t| *t < w).count();
             let total_m = total as f64 / REF_PACE_SEC_PER_KM * 1000.0;
-            let startup_m = total_m * STARTUP_DIST_RATIO;
+            let startup_m = total_m * crate::config::global().run.startup_dist_ratio;
             // 首段配速：窗口秒数 ÷ 窗口里程（分/公里）
             let first_pace_min = (w as f64 / 60.0) / (startup_m / 1000.0);
             // 出窗后的正常配速：剩余秒数 ÷ 剩余里程
@@ -2820,14 +2876,15 @@ mod tests {
             .map(|w| geo::distance((w[0].lat, w[0].lon), (w[1].lat, w[1].lon)))
             .collect();
 
-        // 起步窗口 + 出窗那一步 = 首段里程，应贴近 STARTUP_DIST_RATIO 的预算
+        // 起步窗口 + 出窗那一步 = 首段里程，应贴近配置里的起步里程预算
         // （`segment_json` 首段就是这个量：`cluster` + 一个采样步长）。
         let su_dist: f64 = d_after[..k].iter().sum();
         let total: f64 = d_after.iter().sum();
         let ratio = su_dist / total;
+        let budget = crate::config::global().run.startup_dist_ratio;
         assert!(
-            (ratio - STARTUP_DIST_RATIO).abs() < 0.006,
-            "起步窗口里程占比 {:.3}，应贴近 {STARTUP_DIST_RATIO}",
+            (ratio - budget).abs() < 0.006,
+            "起步窗口里程占比 {:.3}，应贴近 {budget}",
             ratio
         );
         // 窗口外的相对幅度必须保住：压缩后 / 压缩前 的比值应当是同一个常数。
@@ -2887,6 +2944,103 @@ mod tests {
         assert!(
             sd_after > sd_before * 0.8 && sd_after > 0.5,
             "窗口外点距标准差 {sd_before:.2}m → {sd_after:.2}m：起伏被抹平了"
+        );
+    }
+
+    /// **起步里程预算**决定起步段的点挤不挤 —— 预算越大，每点间距越大。
+    ///
+    /// 这条守的是「起步点团」这件事的因果关系，不是某个具体数字：
+    /// 真机基准 1.1% 下，555 秒 / 1684 米的跑，起步窗口 18 个点全落在
+    /// 约 18 米内（每点约 1.0 米）；预算放到 3% 就是每点约 2.6 米。
+    ///
+    /// 同时守住两件事：
+    /// 1. 预算单调 ⇒ 每点间距单调（调这个旋钮确实管用）；
+    /// 2. **窗口外的点距不受影响**（预算只动起步窗口，窗口外的速度起伏
+    ///    必须原样保住）—— 否则这个旋钮会变成「整条轨迹都变形」。
+    #[test]
+    fn startup_budget_controls_how_crowded_the_startup_points_are() {
+        let path = oval_1683();
+        let times = sample_times(555, START_MS_SAMPLE_RATE_TESTS, SAMPLE_INTERVAL_SEC);
+        let raw = sample_by_time(
+            &path,
+            &times,
+            START_MS_SAMPLE_RATE_TESTS as u64,
+            &kinematics::KinParams::default(),
+            1.0,
+            8.0,
+            &[],
+            &[],
+        );
+        let k = startup_point_count(&times, START_MS_SAMPLE_RATE_TESTS, 555);
+        assert_eq!(k, 18, "真机起步窗口是 18 个点");
+
+        let per_point = |ratio: f64| -> (f64, Vec<f64>) {
+            let mut after = raw.clone();
+            compress_startup_with_ratio(
+                &mut after,
+                START_MS_SAMPLE_RATE_TESTS,
+                555,
+                None,
+                &[],
+                ratio,
+            );
+            let d: Vec<f64> = after
+                .windows(2)
+                .map(|w| geo::distance((w[0].lat, w[0].lon), (w[1].lat, w[1].lon)))
+                .collect();
+            let head = d[..k].iter().sum::<f64>() / k as f64;
+            (head, d)
+        };
+
+        let (real_dev, _) = per_point(REAL_DEVICE_STARTUP_DIST_RATIO);
+        let (mid, _) = per_point(0.03);
+        let (loose, _) = per_point(0.06);
+
+        println!(
+            "[startup] 每点间距：真机预算 {:.1}% → {real_dev:.2}m，3% → {mid:.2}m，6% → {loose:.2}m",
+            REAL_DEVICE_STARTUP_DIST_RATIO * 100.0
+        );
+        assert!(
+            real_dev < 1.5,
+            "真机基准下每点应约 1.0 米，实际 {real_dev:.2} 米"
+        );
+        assert!(
+            mid > real_dev * 1.5,
+            "预算 3% 的每点间距应明显大于真机基准：{mid:.2} vs {real_dev:.2}"
+        );
+        assert!(loose > mid, "预算越大每点间距越大：{loose:.2} vs {mid:.2}");
+        // 全程总里程不许变（压缩只重新分配，不许凭空多出或少掉路程）。
+        let total_raw: f64 = raw
+            .windows(2)
+            .map(|w| geo::distance((w[0].lat, w[0].lon), (w[1].lat, w[1].lon)))
+            .sum();
+        // 总里程：压缩只**重新分配**弧长，不许凭空多出或少掉路程。
+        //
+        // ⚠️ 这里量的是**弦长**（上报点之间的距离），不是折线的弧长 ——
+        // 压缩把窗口内的采样点挤到一小段上，窗口外的点被拉长，而拉长之后
+        // 每段的弦/弧比会下降（弯道处尤其明显）⇒ 弦长之和**必然**比压缩前
+        // 少一点。真机预算（1.1%）实测 -2.8%，3% 预算实测 -1.9%。
+        //
+        // 所以判据不是「守恒到 1%」，而是：
+        // 1. 缩水有界（< 5%）；
+        // 2. **预算调大 ⇒ 缩水变小**（窗口内少挤掉一点，窗口外少拉长一点，
+        //    补偿更完整）—— 这条才是「这个旋钮不会让里程更不准」的保证。
+        let (_, d_real) = per_point(REAL_DEVICE_STARTUP_DIST_RATIO);
+        let (_, d3) = per_point(0.03);
+        let total_3: f64 = d3.iter().sum();
+        let total_real: f64 = d_real.iter().sum();
+        println!(
+            "[startup] 总里程：压缩前 {total_raw:.1}m，真机预算后 {total_real:.1}m（{:.1}%），3% 后 {total_3:.1}m（{:.1}%）",
+            (total_real - total_raw) / total_raw * 100.0,
+            (total_3 - total_raw) / total_raw * 100.0,
+        );
+        assert!(
+            (total_3 - total_raw).abs() < total_raw * 0.05,
+            "压缩后总里程 {total_3:.1}m vs 压缩前 {total_raw:.1}m：缩水超过 5%"
+        );
+        assert!(
+            total_3 >= total_real,
+            "预算调大后总里程不该更短：3% 档 {total_3:.1}m < 真机档 {total_real:.1}m"
         );
     }
 

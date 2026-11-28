@@ -213,6 +213,7 @@ impl Config {
                 "run.run_mode" => cfg.run.run_mode = v.as_int(),
                 "run.step_m" => cfg.run.step_m = v.as_float(),
                 "run.bulge_max" => cfg.run.bulge_max = v.as_float(),
+                "run.startup_dist_ratio" => cfg.run.startup_dist_ratio = v.as_float(),
                 "run.pt_scheme" => {
                     cfg.run.pt_scheme = match v.as_str() {
                         "old" => PtScheme::Old,

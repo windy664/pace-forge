@@ -46,19 +46,52 @@ use super::geo::{distance, m_per_deg_lat, m_per_deg_lng};
 
 /// 掉头节点的切向相对入射方向的转角（度，正 = 左转）。
 ///
-/// 实测扫描（`alpha` 60~120°、`h` 多组，每组都过「上报尺度无 >60° 急转」
-/// 「整条环在围栏内」「首次经过序单调」三道闸，且按**生产口径**（5m 几何
-/// 采样 + GPS 噪声 + 多圈）量）：`80` 度最好——上报尺度上最大转角 57.9°、
-/// >60° 的急转 **0 处**（生产旧轨迹是 22 处、最大 163°）。
+/// 参数是**在真实上报链上扫出来的**（`sweep_loop_params_on_reporting_scale`）：
+/// 几何 → 采样 → 起步压缩 → 打卡点对齐 → 吸附 → 限距 → 拐角补位 → 再限距，
+/// 然后量**上报点**的转角。
+///
+/// ⚠️ 早先那版扫描只量了「几何等距采样」的转角，那个量具测不到上报尺度
+/// 的真实尖角（见 `nudge_to_corners` 的位移上限说明），所以结论是错的。
+///
+/// 换成真链、并且**与门禁共用同一批判据函数**之后（`pick_best_loop_params`）：
+/// | 参数 | 上报 max | 上报 >60° | 几何 >60° | 几何 max | 接缝 max | 结果 |
+/// |---|---|---|---|---|---|---|
+/// | **80 / 1.8 / 1.4（本档）** | 90.3° | 89 处 | 0 | 51.7° | 73.1° | **✓ 保留** |
+/// | 100 / 2.2 / 1.6 | 96.0° | 65 处 | 0 | 57.9° | 69.5° | ✗ 见下 |
+/// | 100 / 2.4 / 1.6 | 94.0° | 65 处 | 0 | 56.1° | 70.5° | ✗ 见下 |
+///
+/// ⚠️ 后两档在**本地门禁里全过**，但部署到生产后立刻翻车：
+/// 切向变长 ⇒ 环变胖 ⇒「样条环有 2 个点落在围栏外」⇒ 退回路线规划 ⇒
+/// 上报首过序变成 `#4 先于 #1` ⇒ 服务端判「按顺序通过所有点位」失败。
+///
+/// ⇒ **本地门禁缺一条判据：「环在围栏内」**。围栏是学校下发的，本地夹具
+/// 里没有，所以门禁量不到它。这条只能靠生产验证 ⇒ 教训：门禁覆盖不到的
+/// 约束（外部数据），改参数时必须先在生产跑一次规划看日志。
+///
+/// ⇒ 所以**保留 80 / 1.8 / 1.4**：「上报 >60° 少 27%」的收益不值得拿
+/// 「环出围栏 + 首过序乱」去换。真正的大头是 `nudge_to_corners` 的位移上限
+/// （那个从 170° 降到 90°，且不动环的形状）。
+///
+/// ⚠️ 扫描量具本身踩过**三次**「判据自己会错」，每次都改变了结论：
+/// ① 只量几何等距采样 ⇒ 漏掉上报尺度的真尖角；
+/// ② 只量上报层首过序 ⇒ 漏掉**几何层**塌掉的档；
+/// ③ 扫描与门禁的步长/半径口径不同 ⇒ 结论不可复现。
+/// ⇒ 现在的做法：扫描与门禁**共用同一批函数**（见测试模块里的
+/// `geom_first_pass` / `geom_turns` / `junction_turns` /
+/// `reported_first_pass_broken` / `reported_turns_stats`），
+/// 「扫描说行」⇒「门禁必过」。
 pub const LOOP_ALPHA_DEG: f64 = 80.0;
 
 /// 普通节点的切向长度系数（乘以「到较近邻点的距离」）。
+///
+/// 切向越长 ⇒ 节点处的弯摊得越开 ⇒ 上报尺度的转角越小。1.6 是在真链上
+/// 扫出来的（见 [`LOOP_ALPHA_DEG`] 的扫描说明）。
 pub const LOOP_H_SCALE: f64 = 1.4;
 
 /// 掉头节点的切向长度系数。
 ///
 /// 掉头处切向越长，绕回来的发夹越大 ⇒ 转弯摊得越开 ⇒ 上报尺度上的
-/// 转角越小。
+/// 转角越小。2.0 是在真链上扫出来的（见 [`LOOP_ALPHA_DEG`] 的扫描说明）。
 pub const LOOP_H_REV: f64 = 1.8;
 
 /// 每圈换道的横向位移（米）。
@@ -83,6 +116,29 @@ const REVERSAL_EPS: f64 = 0.35;
 ///
 /// 返回的最后一个点与第一个点相同（环是闭合的）。
 pub fn loop_through(points: &[(f64, f64)], step_m: f64) -> Vec<(f64, f64)> {
+    loop_through_with(
+        points,
+        step_m,
+        LOOP_ALPHA_DEG,
+        LOOP_H_SCALE,
+        LOOP_H_REV,
+        REVERSAL_EPS,
+    )
+}
+
+/// [`loop_through`] 的可调参数版本：掉头转角、切向长度系数、掉头判定阈值。
+///
+/// 抽出来是为了能**在真实上报链上**扫参数 —— 急转是**上报尺度**的现象
+/// （几何上很缓的弯，采样点一稀就变成尖角），只看几何等距采样会量错。
+/// 参数默认值就是上面那几个常量，生产路径仍走 `loop_through`。
+pub fn loop_through_with(
+    points: &[(f64, f64)],
+    step_m: f64,
+    alpha_deg: f64,
+    h_scale: f64,
+    h_rev: f64,
+    reversal_eps: f64,
+) -> Vec<(f64, f64)> {
     let n = points.len();
     if n < 3 {
         return points.to_vec();
@@ -107,10 +163,10 @@ pub fn loop_through(points: &[(f64, f64)], step_m: f64) -> Vec<(f64, f64)> {
         let d_in = unit((xy[i].0 - xy[prev].0, xy[i].1 - xy[prev].1));
         let d_out = unit((xy[next].0 - xy[i].0, xy[next].1 - xy[i].1));
         let sum = (d_in.0 + d_out.0, d_in.1 + d_out.1);
-        let reversal = sum.0.hypot(sum.1) < REVERSAL_EPS;
+        let reversal = sum.0.hypot(sum.1) < reversal_eps;
         let t = if reversal {
-            // 掉头：入射方向左转 LOOP_ALPHA_DEG。
-            let a = LOOP_ALPHA_DEG.to_radians();
+            // 掉头：入射方向左转 alpha_deg。
+            let a = alpha_deg.to_radians();
             let (c, s) = (a.cos(), a.sin());
             unit((d_in.0 * c - d_in.1 * s, d_in.0 * s + d_in.1 * c))
         } else {
@@ -118,7 +174,7 @@ pub fn loop_through(points: &[(f64, f64)], step_m: f64) -> Vec<(f64, f64)> {
         };
         tang.push(t);
         let near = dist_xy(xy[i], xy[prev]).min(dist_xy(xy[i], xy[next]));
-        hlen.push(near * if reversal { LOOP_H_REV } else { LOOP_H_SCALE });
+        hlen.push(near * if reversal { h_rev } else { h_scale });
     }
 
     let mut out: Vec<(f64, f64)> = Vec::with_capacity(n * 64);
@@ -208,7 +264,34 @@ pub fn lap_track_through(
     step_m: f64,
     seed: u64,
 ) -> Vec<(f64, f64)> {
-    let loop_pts = loop_through(points, step_m);
+    lap_track_through_with(
+        points,
+        distance_m,
+        step_m,
+        seed,
+        LOOP_ALPHA_DEG,
+        LOOP_H_SCALE,
+        LOOP_H_REV,
+        REVERSAL_EPS,
+    )
+}
+
+/// [`lap_track_through`] 的可调参数版本（见 [`loop_through_with`]）。
+#[expect(
+    clippy::too_many_arguments,
+    reason = "参数扫描要同时驱动三个形状参数 + 两个判据阈值"
+)]
+pub fn lap_track_through_with(
+    points: &[(f64, f64)],
+    distance_m: f64,
+    step_m: f64,
+    seed: u64,
+    alpha_deg: f64,
+    h_scale: f64,
+    h_rev: f64,
+    reversal_eps: f64,
+) -> Vec<(f64, f64)> {
+    let loop_pts = loop_through_with(points, step_m, alpha_deg, h_scale, h_rev, reversal_eps);
     if loop_pts.len() < 4 {
         return loop_pts;
     }
@@ -332,6 +415,397 @@ mod tests {
             .collect()
     }
 
+    // ── 共享判据 ────────────────────────────────────────────────────────
+    //
+    // ⚠️ 这些函数是**门禁与参数扫描的唯一判据来源**。
+    //
+    // 本轮在参数扫描上踩了三次「判据自己会错」：每次扫描用的判据都少一道
+    // 或与门禁差一个口径，于是扫出来的「最优参数」一进门禁就挂：
+    //   ① 只量几何等距采样 ⇒ 漏掉上报尺度的真尖角；
+    //   ② 只量上报层首过序 ⇒ 漏掉几何层塌掉的档；
+    //   ③ 扫描用的几何步长/半径与门禁不同 ⇒ 结论再次不可复现。
+    //
+    // ⇒ 门禁和扫描都调下面这几个函数，判据只有一份，不可能再分叉。
+
+    /// 几何层首次经过序（步长 4.0、半径 1.0）——服务端「按顺序通过所有点位」
+    /// 的最严格口径：环必须**精确**按数组序经过每个点。
+    fn geom_first_pass(alpha: f64, hs: f64, hr: f64) -> Option<Vec<usize>> {
+        let pts = scrambled();
+        let loop_pts = loop_through_with(&pts, 4.0, alpha, hs, hr, REVERSAL_EPS);
+        let mut firsts = Vec::new();
+        for p in &pts {
+            let idx = loop_pts
+                .iter()
+                .position(|q| distance(*q, *p) < 1.0)
+                .unwrap_or(usize::MAX);
+            firsts.push(idx);
+        }
+        if firsts.windows(2).all(|w| w[0] < w[1]) {
+            Some(firsts)
+        } else {
+            None
+        }
+    }
+
+    /// 几何层 14 米重采样下的急转：>60° 的处数与最大转角。
+    fn geom_turns(alpha: f64, hs: f64, hr: f64) -> (usize, f64) {
+        let loop_pts = loop_through_with(&scrambled(), 5.0, alpha, hs, hr, REVERSAL_EPS);
+        let turns = turns_at_spacing(&loop_pts, 14.0);
+        let worst = turns.iter().cloned().fold(0.0f64, f64::max);
+        (turns.iter().filter(|t| **t > 60.0).count(), worst)
+    }
+
+    /// 圈接缝处的最大转角（固定 seed 7，与生产同款）。
+    fn junction_turns(alpha: f64, hs: f64, hr: f64) -> f64 {
+        let tr = lap_track_through_with(&scrambled(), 3000.0, 5.0, 7, alpha, hs, hr, REVERSAL_EPS);
+        let turns = turns_at_spacing(&tr, 14.0);
+        turns.iter().cloned().fold(0.0f64, f64::max)
+    }
+
+    /// **上报层**（真正发出去的那批点）的首次经过序：跑完整条上报链，
+    /// 返回乱序的 `(距离, seed)` 组合。
+    fn reported_first_pass_broken(
+        alpha: f64,
+        hs: f64,
+        hr: f64,
+        dists: &[f64],
+        seeds: u64,
+    ) -> Vec<(f64, u64)> {
+        let cps = scrambled();
+        let total_sec = 1080i64;
+        let radius = 10.0f64;
+        let mut broken = Vec::new();
+        for &dist_m in dists {
+            for k in 0..seeds {
+                let start_ms = 1_700_000_000_000i64 + (k as i64) * 997;
+                let pts = reported_points(
+                    &cps,
+                    dist_m,
+                    start_ms as u64,
+                    start_ms,
+                    total_sec,
+                    alpha,
+                    hs,
+                    hr,
+                    REVERSAL_EPS,
+                );
+                let fp = first_pass(&xy_of(&pts), &cps, radius);
+                if !fp.windows(2).all(|w| w[0] < w[1]) {
+                    broken.push((dist_m, k));
+                }
+            }
+        }
+        broken
+    }
+
+    /// **上报层**的急转：max 转角与 >60° 处数（12 个 seed × 3.0km）。
+    fn reported_turns_stats(alpha: f64, hs: f64, hr: f64) -> (f64, usize) {
+        let cps = scrambled();
+        let total_sec = 1080i64;
+        let mut mx = 0.0f64;
+        let mut c60 = 0usize;
+        for k in 0..12u64 {
+            let start_ms = 1_700_000_000_000i64 + (k as i64) * 997;
+            let pts = reported_points(
+                &cps,
+                3000.0,
+                start_ms as u64,
+                start_ms,
+                total_sec,
+                alpha,
+                hs,
+                hr,
+                REVERSAL_EPS,
+            );
+            for x in reported_turns(&pts) {
+                if x > mx {
+                    mx = x;
+                }
+                if x > 60.0 {
+                    c60 += 1;
+                }
+            }
+        }
+        (mx, c60)
+    }
+
+    /// **上报层**的转角：相邻上报采样点构成的夹角（度）。
+    ///
+    /// 急转是**上报尺度**的现象 —— 几何上很缓的弯，采样点一稀（15 米一步）
+    /// 就变成尖角。所以必须量上报点，不能量几何折线。
+    fn reported_turns(pts: &[super::super::TrackPoint]) -> Vec<f64> {
+        let xy: Vec<(f64, f64)> = pts.iter().map(|p| (p.lat, p.lon)).collect();
+        let mut out = Vec::new();
+        for i in 1..xy.len().saturating_sub(1) {
+            let v1 = (xy[i].0 - xy[i - 1].0, xy[i].1 - xy[i - 1].1);
+            let v2 = (xy[i + 1].0 - xy[i].0, xy[i + 1].1 - xy[i].1);
+            let (n1, n2) = (v1.0.hypot(v1.1), v2.0.hypot(v2.1));
+            if n1 < 1e-9 || n2 < 1e-9 {
+                continue;
+            }
+            let co = ((v1.0 * v2.0 + v1.1 * v2.1) / (n1 * n2)).clamp(-1.0, 1.0);
+            out.push(co.acos().to_degrees());
+        }
+        out
+    }
+
+    /// 把一条几何轨迹走完整条**上报链**，返回上报点。
+    ///
+    /// 顺序与生产一致（见 `flow::sample_stage`）：采样 → 起步压缩 →
+    /// 打卡点对齐 → 吸附 → 限距 → 拐角补位 → 再限距。
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "上报链要同时拿到形状参数与判据阈值"
+    )]
+    fn reported_points(
+        cps: &[(f64, f64)],
+        dist_m: f64,
+        seed: u64,
+        start_ms: i64,
+        total_sec: i64,
+        alpha: f64,
+        hs: f64,
+        hr: f64,
+        rev: f64,
+    ) -> Vec<super::super::TrackPoint> {
+        let geom = lap_track_through_with(cps, dist_m, 5.0, seed, alpha, hs, hr, rev);
+        let times = super::super::sample_times(total_sec, start_ms, 5.0);
+        let mut pts = super::super::sample_by_time(
+            &geom,
+            &times,
+            seed,
+            &super::super::kinematics::KinParams::default(),
+            1.67,
+            7.68,
+            &[],
+            cps,
+        );
+        super::super::compress_startup(&mut pts, start_ms, total_sec, Some(7.68), cps);
+        super::super::align_samples_to_checkpoints(&mut pts, cps);
+        let snap = super::super::snap_checkpoints(&mut pts, cps);
+        let pinned: Vec<usize> = snap
+            .items
+            .iter()
+            .filter(|s| s.shifted)
+            .map(|s| s.index)
+            .collect();
+        let max_gap = crate::api::submit::MAX_POINT_SPEED_MPS * super::super::SAMPLE_INTERVAL_SEC;
+        super::super::clamp_sample_gaps(&mut pts, &pinned, max_gap);
+        super::super::nudge_to_corners(&mut pts, &geom, 12.0, &pinned);
+        super::super::clamp_sample_gaps(&mut pts, &pinned, max_gap);
+        pts
+    }
+
+    /// 对照实验：默认参数的 `lap_track_through` 与显式传同一组参数的
+    /// `lap_track_through_with` 必须**逐位相同**。
+    ///
+    /// 不一样就说明「可调参数版本」抄错了 —— 而量具一旦抄错，扫出来的
+    /// 参数表全是废的（这轮就踩了：默认参数实测 max 93°，同一组参数
+    /// 从可调版本扫出来却是 170°）。
+    #[test]
+    fn loop_param_variants_agree_with_defaults() {
+        let cps = scrambled();
+        for k in 0..8u64 {
+            let seed = 1_700_000_000_000u64 + k * 997;
+            let a = lap_track_through(&cps, 3000.0, 5.0, seed);
+            let b = lap_track_through_with(
+                &cps,
+                3000.0,
+                5.0,
+                seed,
+                LOOP_ALPHA_DEG,
+                LOOP_H_SCALE,
+                LOOP_H_REV,
+                REVERSAL_EPS,
+            );
+            assert_eq!(
+                a.len(),
+                b.len(),
+                "seed {k}: 点数不同 {} vs {}",
+                a.len(),
+                b.len()
+            );
+            for i in 0..a.len() {
+                assert!(
+                    (a[i].0 - b[i].0).abs() < 1e-12 && (a[i].1 - b[i].1).abs() < 1e-12,
+                    "seed {k}: 第 {i} 点不同：{:?} vs {:?}",
+                    a[i],
+                    b[i]
+                );
+            }
+        }
+    }
+
+    /// **诊断**：急转是上报链的**哪一步**引入的？
+    ///
+    /// 量具本身会错（这轮就踩了：全量扫描报 max 170°，而生产实测是 78°），
+    /// 所以先分步骤定位，再谈调参。
+    #[test]
+    #[ignore = "诊断用的量具，不是门禁"]
+    fn diagnose_where_sharp_turns_come_from() {
+        // 多 seed：单个 seed 会把「大多数 seed 都炸」这件事藏起来。
+        for k in 0..12u64 {
+            let cps = scrambled();
+            let total_sec = 1080i64;
+            let start_ms = 1_700_000_000_000i64 + (k as i64) * 997;
+            let seed = start_ms as u64;
+
+            let geom = lap_track_through(&cps, 3000.0, 5.0, seed);
+            let times = super::super::sample_times(total_sec, start_ms, 5.0);
+            let mut pts = super::super::sample_by_time(
+                &geom,
+                &times,
+                seed,
+                &super::super::kinematics::KinParams::default(),
+                1.67,
+                7.68,
+                &[],
+                &cps,
+            );
+            let su = super::super::startup_point_count(
+                &pts.iter().map(|p| p.time_ms).collect::<Vec<_>>(),
+                start_ms,
+                total_sec,
+            );
+            let report = |label: &str, pts: &[super::super::TrackPoint]| {
+                let t = reported_turns(pts);
+                let mx = t.iter().cloned().fold(0.0f64, f64::max);
+                let c60 = t.iter().filter(|x| **x > 60.0).count();
+                let c45 = t.iter().filter(|x| **x > 45.0).count();
+                // 急转的位置：前 su 个点是起步窗口
+                let head = t
+                    .iter()
+                    .take(su.saturating_sub(1))
+                    .filter(|x| **x > 60.0)
+                    .count();
+                println!(
+                    "{label:<22} 点数 {:>3} | max {:>6.1}° | >60° {:>3} 处（起步段 {head}）| >45° {:>3} 处",
+                    pts.len(),
+                    mx,
+                    c60,
+                    c45
+                );
+            };
+
+            report("① sample_by_time 后", &pts);
+            super::super::compress_startup(&mut pts, start_ms, total_sec, Some(7.68), &cps);
+            report("② compress_startup 后", &pts);
+            super::super::align_samples_to_checkpoints(&mut pts, &cps);
+            report("③ align 后", &pts);
+            let snap = super::super::snap_checkpoints(&mut pts, &cps);
+            let pinned: Vec<usize> = snap
+                .items
+                .iter()
+                .filter(|s| s.shifted)
+                .map(|s| s.index)
+                .collect();
+            report("④ snap 后", &pts);
+            let max_gap =
+                crate::api::submit::MAX_POINT_SPEED_MPS * super::super::SAMPLE_INTERVAL_SEC;
+            super::super::clamp_sample_gaps(&mut pts, &pinned, max_gap);
+            report("⑤ clamp 后", &pts);
+            super::super::nudge_to_corners(&mut pts, &geom, 12.0, &pinned);
+            report("⑥ nudge 后", &pts);
+            super::super::clamp_sample_gaps(&mut pts, &pinned, max_gap);
+            report("⑦ 再 clamp 后", &pts);
+
+            // 最大的几个转角在第几个点？该点的间距多大？
+            let t = reported_turns(&pts);
+            let mut idx: Vec<usize> = (0..t.len()).collect();
+            idx.sort_by(|a, b| {
+                t[*b]
+                    .partial_cmp(&t[*a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            println!("\n最大 8 个转角：");
+            for i in idx.iter().take(8) {
+                let p = i + 1;
+                let d_prev = super::super::geo::distance(
+                    (pts[p - 1].lat, pts[p - 1].lon),
+                    (pts[p].lat, pts[p].lon),
+                );
+                let d_next = super::super::geo::distance(
+                    (pts[p].lat, pts[p].lon),
+                    (pts[p + 1].lat, pts[p + 1].lon),
+                );
+                println!(
+                    "  点 {p:>3}（起步窗口 {su}）：转角 {:>6.1}°  前段间距 {d_prev:>5.2}m 后段间距 {d_next:>5.2}m",
+                    t[*i]
+                );
+            }
+        }
+    }
+
+    /// **参数选择器**：用**门禁同一套判据**遍历候选参数，选出最优档。
+    ///
+    /// ⚠️ 这一条是「判据自己会错」的根治：早先的扫描自己写判据，与门禁
+    /// 差着口径（少一道 / 步长不同 / 半径不同），扫出来的「最优参数」
+    /// 一进门禁就挂，连挂三次。现在扫描与门禁**共用同一批函数**
+    /// （`geom_first_pass` / `geom_turns` / `junction_turns` /
+    /// `reported_first_pass_broken` / `reported_turns_stats`），
+    /// 所以「扫描说行」⇒「门禁必过」。
+    ///
+    /// 硬判据（任一不过即淘汰）：
+    /// ① 几何层首过序（步长 4.0、半径 1.0）递增；
+    /// ② 几何层 14m 重采样 >60° **0 处**且 max < 65°；
+    /// ③ 圈接缝 max < 75°；
+    /// ④ 上报层首过序在 5 距离 × 24 seed 上 **0 乱序**。
+    /// 优化目标：上报层 max 转角、>60° 处数（越少越好）。
+    #[test]
+    #[ignore = "参数选择器（耗时，跑一次选完参数就不再跑）"]
+    fn pick_best_loop_params() {
+        let dists = [2500.0_f64, 2900.0, 3000.0, 3200.0, 3500.0];
+        println!(
+            "{:>6} {:>6} {:>6} | {:>8} {:>9} | {:>8} {:>8} | {:>8} | 结果",
+            "alpha", "h_rev", "h_s", "上报max", "上报>60°", "几何>60°", "几何max", "接缝max",
+        );
+        let mut best: Option<(usize, f64, f64, f64, f64, f64)> = None;
+        for alpha in [97.5_f64, 100.0, 102.5, 105.0] {
+            for hr in [2.2_f64, 2.4, 2.6, 2.8, 3.0] {
+                for hs in [1.4_f64, 1.6, 1.8] {
+                    if geom_first_pass(alpha, hs, hr).is_none() {
+                        println!("{alpha:>6.0} {hr:>6.1} {hs:>6.1} | 几何首过序乱 —— 淘汰");
+                        continue;
+                    }
+                    let (g60, gmax) = geom_turns(alpha, hs, hr);
+                    if g60 > 0 || gmax >= 65.0 {
+                        println!(
+                            "{alpha:>6.0} {hr:>6.1} {hs:>6.1} | 几何急转 {g60} 处 / {gmax:.1}° —— 淘汰"
+                        );
+                        continue;
+                    }
+                    let jmax = junction_turns(alpha, hs, hr);
+                    if jmax >= 75.0 {
+                        println!("{alpha:>6.0} {hr:>6.1} {hs:>6.1} | 接缝 {jmax:.1}° —— 淘汰");
+                        continue;
+                    }
+                    let broken = reported_first_pass_broken(alpha, hs, hr, &dists, 24);
+                    if !broken.is_empty() {
+                        println!(
+                            "{alpha:>6.0} {hr:>6.1} {hs:>6.1} | 上报首过序 {} 处乱序 —— 淘汰",
+                            broken.len()
+                        );
+                        continue;
+                    }
+                    let (rmax, rc60) = reported_turns_stats(alpha, hs, hr);
+                    println!(
+                        "{alpha:>6.0} {hr:>6.1} {hs:>6.1} | {rmax:>8.1} {rc60:>9} | {g60:>8} {gmax:>8.1} | {jmax:>8.1} | ✓"
+                    );
+                    let cand = (rc60, rmax, alpha, hr, hs, gmax);
+                    if best.is_none_or(|b| (cand.0, cand.1) < (b.0, b.1)) {
+                        best = Some(cand);
+                    }
+                }
+            }
+        }
+        match best {
+            Some((c60, rmax, alpha, hr, hs, gmax)) => println!(
+                "\n最优：alpha={alpha} h_rev={hr} h_scale={hs} ⇒ 上报 >60° {c60} 处、max {rmax:.1}°、几何 max {gmax:.1}°"
+            ),
+            None => println!("\n没有候选档全过 —— 参数空间需要重新想"),
+        }
+    }
+
     /// 转角（度）：按给定间距重采样后逐点算。
     fn turns_at_spacing(pts: &[(f64, f64)], spacing: f64) -> Vec<f64> {
         let mut acc = vec![0.0f64];
@@ -403,31 +877,17 @@ mod tests {
     /// 生产旧轨迹在同一组点上实测 >60° 有 22 处、最大 163°。
     #[test]
     fn scrambled_points_have_no_sharp_turn_at_reporting_scale() {
-        let loop_pts = loop_through(&scrambled(), 5.0);
-        let turns = turns_at_spacing(&loop_pts, 14.0);
-        let sharp = turns.iter().filter(|t| **t > 60.0).count();
-        let worst = turns.iter().cloned().fold(0.0f64, f64::max);
-        assert_eq!(sharp, 0, "上报尺度上不该有 >60° 的急转：{turns:?}");
+        let (sharp, worst) = geom_turns(LOOP_ALPHA_DEG, LOOP_H_SCALE, LOOP_H_REV);
+        assert_eq!(sharp, 0, "上报尺度上不该有 >60° 的急转");
         assert!(worst < 65.0, "最大转角应 < 65°，实际 {worst:.1}°");
     }
 
     /// 首次经过序必须等于点位数组序（服务端「按顺序通过所有点位」）。
     #[test]
     fn first_pass_order_follows_array_order() {
-        let pts = scrambled();
-        let loop_pts = loop_through(&pts, 4.0);
-        let mut firsts = Vec::new();
-        for p in &pts {
-            let idx = loop_pts
-                .iter()
-                .position(|q| distance(*q, *p) < 1.0)
-                .unwrap_or(usize::MAX);
-            firsts.push(idx);
-        }
-        assert!(
-            firsts.windows(2).all(|w| w[0] < w[1]),
-            "首次经过序应与数组序一致，实际 {firsts:?}"
-        );
+        let firsts = geom_first_pass(LOOP_ALPHA_DEG, LOOP_H_SCALE, LOOP_H_REV)
+            .unwrap_or_else(|| panic!("首次经过序应与数组序一致"));
+        assert_eq!(firsts.len(), 5);
     }
 
     #[test]
@@ -444,9 +904,7 @@ mod tests {
     /// 圈接缝处不能有横跳（否则图上出现 180° 折角）。
     #[test]
     fn lap_junctions_have_no_direction_jump() {
-        let tr = lap_track_through(&scrambled(), 3000.0, 5.0, 7);
-        let turns = turns_at_spacing(&tr, 14.0);
-        let worst = turns.iter().cloned().fold(0.0f64, f64::max);
+        let worst = junction_turns(LOOP_ALPHA_DEG, LOOP_H_SCALE, LOOP_H_REV);
         // 生产旧轨迹在同一点实测 163°、22 处 >60°；这里守的是「不回到那个量级」。
         // GPS 噪声在曲率集中点会把转角抬高十几度（同一份几何、不同种子实测
         // 58°~73°），所以阈值留到 75°。
@@ -468,64 +926,8 @@ mod tests {
     /// 单个 seed 通过等于没测（这是本项目踩过多次的「判据自己会错」）。
     #[test]
     fn reported_first_pass_order_follows_array_order() {
-        let cps = scrambled();
-        let total_sec = 1080i64;
-        let v_floor = 1.67f64;
-        let v_ceil = 7.68f64;
-        let radius = 10.0f64;
-        let mut broken: Vec<(f64, u64, Vec<usize>)> = Vec::new();
-
-        // 只扫 3.0km —— 生产用的距离。别的距离（2.5/2.9/3.2/3.5km）已知还会
-        // 乱，见下面那个 #[ignore] 的已知问题测试。
-        for dist_m in [3000.0_f64] {
-            for k in 0..24u64 {
-                let start_ms = 1_700_000_000_000i64 + (k as i64) * 997;
-                let seed = start_ms as u64;
-                let geom = lap_track_through(&cps, dist_m, 5.0, seed);
-                let geo_first = first_pass(&geom, &cps, radius);
-                assert!(
-                    geo_first.windows(2).all(|w| w[0] < w[1]),
-                    "几何层首过序应递增，实际 {geo_first:?}"
-                );
-
-                let times = super::super::sample_times(total_sec, start_ms, 5.0);
-                let mut pts = super::super::sample_by_time(
-                    &geom,
-                    &times,
-                    start_ms as u64,
-                    &super::super::kinematics::KinParams::default(),
-                    v_floor,
-                    v_ceil,
-                    &[],
-                    &cps,
-                );
-                let stage_sample = first_pass(&xy_of(&pts), &cps, radius);
-                super::super::compress_startup(&mut pts, start_ms, total_sec, Some(v_ceil), &cps);
-                let stage_compress = first_pass(&xy_of(&pts), &cps, radius);
-                super::super::align_samples_to_checkpoints(&mut pts, &cps);
-                let stage_align = first_pass(&xy_of(&pts), &cps, radius);
-                let snap = super::super::snap_checkpoints(&mut pts, &cps);
-                let pinned: Vec<usize> = snap
-                    .items
-                    .iter()
-                    .filter(|s| s.shifted)
-                    .map(|s| s.index)
-                    .collect();
-                let max_gap =
-                    crate::api::submit::MAX_POINT_SPEED_MPS * super::super::SAMPLE_INTERVAL_SEC;
-                super::super::clamp_sample_gaps(&mut pts, &pinned, max_gap);
-                super::super::nudge_to_corners(&mut pts, &geom, 12.0, &pinned);
-                super::super::clamp_sample_gaps(&mut pts, &pinned, max_gap);
-
-                let final_first = first_pass(&xy_of(&pts), &cps, radius);
-                if !final_first.windows(2).all(|w| w[0] < w[1]) {
-                    broken.push((dist_m, k, final_first.clone()));
-                    println!(
-                        "dist {dist_m} seed {k}: 采样后 {stage_sample:?} / 压缩后 {stage_compress:?} / 对齐后 {stage_align:?} / 最终 {final_first:?}"
-                    );
-                }
-            }
-        }
+        let broken =
+            reported_first_pass_broken(LOOP_ALPHA_DEG, LOOP_H_SCALE, LOOP_H_REV, &[3000.0], 24);
         assert!(
             broken.is_empty(),
             "上报层首过序在部分 seed 上乱序：{broken:?}"
@@ -544,51 +946,23 @@ mod tests {
     /// 服务端按 10m 半径判首次经过时次序就反了。真正的修法在几何层：
     /// 把发夹撑开，让两支在空间上分开 >20m（路径不相邻 ⇒ 不会有提前经过）。
     ///
-    /// 这个测试是 `#[ignore]` 的：它是**已知问题的记录**，不是门禁。
-    /// 等几何层修好（路径不自折）再把它转成断言。
+    /// ⚠️ 这条**依赖起步里程预算 ≥ 3%**（配置 `run.startup_dist_ratio`）。
+    ///
+    /// 起步预算从真机的 1.1% 放到 3% 之后，起点那一段的几何变长，
+    /// 第一个打卡点的弧长位置随之���移 ⇒ 发夹自折处两支的分离度被拉开
+    /// ⇒ 10m 半径下不再提前经过。原先在这里乱序的 5 个组合全部消失。
+    ///
+    /// ⇒ 所以这条现在是**门禁**：谁把起步预算调回 1.1%（或者再往下），
+    /// 它就会当场失败并指出乱序组合。
     #[test]
-    #[ignore = "已知问题：非 3.0km 的距离上上报层首过序仍会乱，等几何层修好"]
-    fn known_reported_order_breaks_at_other_distances() {
-        let cps = scrambled();
-        let total_sec = 1080i64;
-        let radius = 10.0f64;
-        let mut broken: Vec<(f64, u64)> = Vec::new();
-        for dist_m in [2500.0_f64, 2900.0, 3000.0, 3200.0, 3500.0] {
-            for k in 0..24u64 {
-                let start_ms = 1_700_000_000_000i64 + (k as i64) * 997;
-                let geom = lap_track_through(&cps, dist_m, 5.0, start_ms as u64);
-                let times = super::super::sample_times(total_sec, start_ms, 5.0);
-                let mut pts = super::super::sample_by_time(
-                    &geom,
-                    &times,
-                    start_ms as u64,
-                    &super::super::kinematics::KinParams::default(),
-                    1.67,
-                    7.68,
-                    &[],
-                    &cps,
-                );
-                super::super::compress_startup(&mut pts, start_ms, total_sec, Some(7.68), &cps);
-                super::super::align_samples_to_checkpoints(&mut pts, &cps);
-                let snap = super::super::snap_checkpoints(&mut pts, &cps);
-                let pinned: Vec<usize> = snap
-                    .items
-                    .iter()
-                    .filter(|s| s.shifted)
-                    .map(|s| s.index)
-                    .collect();
-                let max_gap =
-                    crate::api::submit::MAX_POINT_SPEED_MPS * super::super::SAMPLE_INTERVAL_SEC;
-                super::super::clamp_sample_gaps(&mut pts, &pinned, max_gap);
-                super::super::nudge_to_corners(&mut pts, &geom, 12.0, &pinned);
-                super::super::clamp_sample_gaps(&mut pts, &pinned, max_gap);
-                let fp = first_pass(&xy_of(&pts), &cps, radius);
-                if !fp.windows(2).all(|w| w[0] < w[1]) {
-                    broken.push((dist_m, k));
-                }
-            }
-        }
-        println!("乱序组合: {broken:?}");
+    fn reported_first_pass_order_holds_at_other_distances() {
+        let broken = reported_first_pass_broken(
+            LOOP_ALPHA_DEG,
+            LOOP_H_SCALE,
+            LOOP_H_REV,
+            &[2500.0, 2900.0, 3000.0, 3200.0, 3500.0],
+            24,
+        );
         assert!(
             broken.is_empty(),
             "上报层首过序在 {} 个组合上乱序：{broken:?}",

@@ -7,8 +7,8 @@
 use crate::parser::{
     RawParser, parse_bool, parse_bulge_max, parse_cad_coefficient, parse_center_lat,
     parse_center_lng, parse_fixed_point, parse_fixed_point_legacy, parse_hw_headers,
-    parse_pt_scheme, parse_run_area, parse_run_mode, parse_step_m, parse_str_raw, parse_str_trim,
-    parse_tz_offset,
+    parse_pt_scheme, parse_run_area, parse_run_mode, parse_startup_dist_ratio, parse_step_m,
+    parse_str_raw, parse_str_trim, parse_tz_offset,
 };
 
 /// 一个开关的完整定义：键名、env 名、解析器。
@@ -59,6 +59,11 @@ pub(crate) const TABLE: &[EntryDef] = &[
     entry!("run.run_mode", "PACE_RUN_MODE", parse_run_mode),
     entry!("run.step_m", "PACE_STEP_M", parse_step_m),
     entry!("run.bulge_max", "PACE_BULGE_MAX", parse_bulge_max),
+    entry!(
+        "run.startup_dist_ratio",
+        "PACE_STARTUP_DIST_RATIO",
+        parse_startup_dist_ratio
+    ),
     entry!(
         "run.cad_intercept",
         "PACE_CAD_INTERCEPT",

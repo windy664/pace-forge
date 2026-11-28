@@ -130,6 +130,13 @@ pub(crate) fn parse_step_m(raw: &str) -> Result<Value, String> {
 pub(crate) fn parse_bulge_max(raw: &str) -> Result<Value, String> {
     float_in_range(0.0, 300.0)(raw)
 }
+/// 起步窗口的里程占比。
+///
+/// 0 是「起步段完全压成一点」（点全叠在一起，报文会出现 0 位移的采样点），
+/// 0.155 是「时间占比 = 里程占比」= 完全不压缩。两者之间都是合法值。
+pub(crate) fn parse_startup_dist_ratio(raw: &str) -> Result<Value, String> {
+    float_in_range(0.001, 0.5)(raw)
+}
 pub(crate) fn parse_center_lat(raw: &str) -> Result<Value, String> {
     float_in_range(-90.0, 90.0)(raw)
 }
