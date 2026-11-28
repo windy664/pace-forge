@@ -844,6 +844,70 @@ mod tests {
         }
     }
 
+    /// **校园跑夹具**：真实围栏 + 打卡点 ⇒ 「环在围栏内」这条判据搬进本地。
+    ///
+    /// 围栏是学校下发的外部数据，本地夹具以前没有 ⇒ 门禁量不到「环在围栏内」
+    /// ⇒ 改参数只能靠「部署到生产跑一次规划看日志」⇒ 上一轮就这样翻车过
+    /// （切向变长 ⇒ 环变胖 ⇒ 2 个点出围栏 ⇒ 退回路线规划 ⇒ 首过序乱，
+    /// 而本地门禁全绿）。
+    ///
+    /// 夹具 `src/track/campus_fixture.json`：某高校的围栏 ring 与 5 个打卡点，
+    /// 都是 **BD-09**（与服务端下发同口径；上报时网关自己转 GCJ-02）。
+    /// checkpoints 的顺序 = 服务端返回的**数组序**（决定绕圈次序）。
+    ///
+    /// 这条守：样条环和**上报点**都必须在围栏内（生产那边是「出围栏就退回
+    /// 路线规划」，本地这边是直接失败）。
+    #[test]
+    fn campus_loop_stays_inside_the_fence() {
+        let fx: serde_json::Value =
+            serde_json::from_str(include_str!("campus_fixture.json")).expect("夹具 JSON");
+        let nums = |k: &str| -> Vec<(f64, f64)> {
+            fx[k]
+                .as_array()
+                .unwrap_or_else(|| panic!("夹具缺 {k}"))
+                .iter()
+                .map(|v| {
+                    (
+                        v["lat"].as_f64().expect("lat"),
+                        v["lng"].as_f64().expect("lng"),
+                    )
+                })
+                .collect()
+        };
+        let cps = nums("checkpoints");
+        let fence = nums("fence");
+        assert!(cps.len() >= 3 && fence.len() >= 3, "夹具不完整");
+        let mut bad_loop = 0usize;
+        let mut bad_reported = 0usize;
+        for k in 0..8u64 {
+            let start_ms = 1_700_000_000_000i64 + (k as i64) * 997;
+            // 生产的操场环就是这一条（`flow::stadium_loop_track`）。
+            let loop_pts = lap_track_through(&cps, 3000.0, 5.0, start_ms as u64);
+            bad_loop += loop_pts
+                .iter()
+                .filter(|p| !crate::track::fence_route::contains(&fence, p.0, p.1))
+                .count();
+            let pts = reported_points_with_ratio(
+                &cps,
+                3000.0,
+                start_ms as u64,
+                start_ms,
+                1080,
+                LOOP_ALPHA_DEG,
+                LOOP_H_SCALE,
+                LOOP_H_REV,
+                REVERSAL_EPS,
+                super::super::REAL_DEVICE_STARTUP_DIST_RATIO,
+            );
+            bad_reported += pts
+                .iter()
+                .filter(|p| !crate::track::fence_route::contains(&fence, p.lat, p.lon))
+                .count();
+        }
+        assert_eq!(bad_loop, 0, "样条环有 {bad_loop} 个点落在围栏外");
+        assert_eq!(bad_reported, 0, "上报点有 {bad_reported} 个落在围栏外");
+    }
+
     /// 转角（度）：按给定间距重采样后逐点算。
     fn turns_at_spacing(pts: &[(f64, f64)], spacing: f64) -> Vec<f64> {
         let mut acc = vec![0.0f64];
