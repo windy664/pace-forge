@@ -1031,6 +1031,31 @@ pub fn apply_gps_dropouts(
         if cuts_corner {
             continue;
         }
+        // ⚠️ 候选不许落在**路径折返**（发夹）附近。
+        //
+        // 掉点把点往回拽 ⇒ 发夹处那一批点被拽散 ⇒ 上报折线在那里出现
+        // 125°~163° 的尖刺（生产实测，真机没有）。机制：发夹的顶点前后两个
+        // 点只差 0.2m（路径自己折回来），掉点把前面那个点拽走 20m ⇒
+        // 折线变成「出去 21.9m 再回来 0.2m」⇒ 一个尖刺。
+        //
+        // 判据 = **弧长 / 弦长**：正常路段 ≈ 1.0；路径折返的区间里
+        // 弧长远大于弦长（实测 60×）⇒ 用 2.0 当门槛。
+        //
+        // 掉点的影响范围是它自己 + 后面两段（补段会把后面两段都拉长），
+        // 所以这三段里不许有折返。
+        let mut folds = false;
+        for j in i..(i + 3).min(n - 1) {
+            let pa = point_at_arc(path, arc, s[j]);
+            let pb = point_at_arc(path, arc, s[j + 1]);
+            let chord = geo::distance(pa, pb).max(0.5);
+            if (s[j + 1] - s[j]) > 2.0 * chord {
+                folds = true;
+                break;
+            }
+        }
+        if folds {
+            continue;
+        }
         cands.push(i);
     }
     if cands.is_empty() {
